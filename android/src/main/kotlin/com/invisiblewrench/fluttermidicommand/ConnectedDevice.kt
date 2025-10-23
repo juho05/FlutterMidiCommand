@@ -47,7 +47,7 @@ class ConnectedDevice : Device {
                             Log.d("FlutterMIDICommand", "Input port opened successfully")
                         }
                     }
-                    
+
                     if (deviceInfo.outputPortCount > 0) {
                         Log.d("FlutterMIDICommand", "Open output port")
                         // This can also block - keep on background thread
@@ -98,7 +98,7 @@ class ConnectedDevice : Device {
         // Cancel any ongoing connection attempts to prevent leaks
         connectionJob?.cancel()
         connectionJob = null
-        
+
         Log.d("FlutterMIDICommand", "Flush input port ${this.inputPort}")
         this.inputPort?.flush()
         Log.d("FlutterMIDICommand", "Close input port ${this.inputPort}")
