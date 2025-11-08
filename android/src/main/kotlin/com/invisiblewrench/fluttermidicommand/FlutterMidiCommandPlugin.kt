@@ -109,9 +109,13 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
       return
     }
 
-    handler = Handler(context.mainLooper)
-    midiManager = context.getSystemService(Context.MIDI_SERVICE) as MidiManager
-    midiManager.registerDeviceCallback(deviceConnectionCallback, handler)
+    if (!::handler.isInitialized) {
+      handler = Handler(context.mainLooper)
+    }
+    if (!::midiManager.isInitialized) {
+      midiManager = context.getSystemService(Context.MIDI_SERVICE) as MidiManager
+      midiManager.registerDeviceCallback(deviceConnectionCallback, handler)
+    }
 
     rxStreamHandler = FMCStreamHandler(handler)
     rxChannel = EventChannel(messenger, "plugins.invisiblewrench.com/flutter_midi_command/rx_channel")
