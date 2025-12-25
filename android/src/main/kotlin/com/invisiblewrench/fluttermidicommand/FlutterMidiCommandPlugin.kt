@@ -423,7 +423,7 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
         midiManager.openBluetoothDevice(bleDevices.first(), deviceOpenedListener, handler)
       }
     } else if (type == "native") {
-      val devices =  midiManager.devices.filter { d -> d.id.toString() == deviceId }
+      val devices =  midiManager.devices.filter { d -> Device.deviceIdForInfo(d) == deviceId }
       if (devices.isEmpty()) {
         Log.d("FlutterMIDICommand", "not found device $devices")
         return "Device not found"
