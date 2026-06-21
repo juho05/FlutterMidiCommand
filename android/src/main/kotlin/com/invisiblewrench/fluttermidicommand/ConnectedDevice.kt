@@ -15,6 +15,16 @@ class ConnectedDevice : Device {
     private var isOwnVirtualDevice = false
     private var connectionJob: Job? = null
 
+    override val deviceInfo: Map<String, Any?>
+        get() {
+            val isBluetoothDevice = midiDevice.info.type == MidiDeviceInfo.TYPE_BLUETOOTH
+            return mapOf(
+                "id" to id,
+                "name" to midiDevice.info.properties.getString(MidiDeviceInfo.PROPERTY_NAME),
+                "type" to if (isBluetoothDevice) "BLE" else "native"
+            )
+        }
+
     constructor(device:MidiDevice, setupStreamHandler: FMCStreamHandler) : super(deviceIdForInfo(device.info), device.info.type.toString()) {
         this.midiDevice = device
         this.setupStreamHandler = setupStreamHandler
@@ -95,23 +105,32 @@ class ConnectedDevice : Device {
 
     override fun close() {
         Log.d("FlutterMIDICommand", "Close device - cancelling connection job")
-        // Cancel any ongoing connection attempts to prevent leaks
-        connectionJob?.cancel()
-        connectionJob = null
+        // Capture device identity before tearing down, while midiDevice.info is still valid
+        val info = deviceInfo
+        try {
+            // Cancel any ongoing connection attempts to prevent leaks
+            connectionJob?.cancel()
+            connectionJob = null
 
-        Log.d("FlutterMIDICommand", "Flush input port ${this.inputPort}")
-        this.inputPort?.flush()
-        Log.d("FlutterMIDICommand", "Close input port ${this.inputPort}")
-        this.inputPort?.close()
-        Log.d("FlutterMIDICommand", "Close output port ${this.outputPort}")
-        this.outputPort?.close()
-        Log.d("FlutterMIDICommand", "Disconnect receiver ${this.receiver}")
-        this.outputPort?.disconnect(this.receiver)
-        this.receiver = null
-        Log.d("FlutterMIDICommand", "Close device ${this.midiDevice}")
-        this.midiDevice.close()
+            Log.d("FlutterMIDICommand", "Flush input port ${this.inputPort}")
+            this.inputPort?.flush()
+            Log.d("FlutterMIDICommand", "Close input port ${this.inputPort}")
+            this.inputPort?.close()
+            Log.d("FlutterMIDICommand", "Close output port ${this.outputPort}")
+            this.outputPort?.close()
+            Log.d("FlutterMIDICommand", "Disconnect receiver ${this.receiver}")
+            this.outputPort?.disconnect(this.receiver)
+            this.receiver = null
+            Log.d("FlutterMIDICommand", "Close device ${this.midiDevice}")
+            this.midiDevice.close()
+        } catch (e: Exception) {
+            // The device may already be gone (e.g. physically removed), so teardown
+            // can fail. Swallow it so listeners are still notified of the disconnect.
+            Log.w("FlutterMIDICommand", "Error while closing device: $e")
+        }
 
         setupStreamHandler?.send("deviceDisconnected")
+        disconnectStreamHandler?.send(info)
     }
 
     class RXReceiver(stream: FMCStreamHandler, device: MidiDevice) : MidiReceiver() {

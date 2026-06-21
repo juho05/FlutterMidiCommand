@@ -52,7 +52,10 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     
     var bluetoothStateChannel: FlutterEventChannel?
     var bluetoothStateHandler = StreamHandler()
-    
+
+    var disconnectChannel: FlutterEventChannel?
+    var disconnectStreamHandler = StreamHandler()
+
     
 #if os(iOS)
     // Network Session
@@ -105,7 +108,14 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
 #endif
         midiSetupChannel?.setStreamHandler(setupStreamHandler)
         bluetoothStateChannel?.setStreamHandler(bluetoothStateHandler)
-        
+
+#if os(macOS)
+        disconnectChannel = FlutterEventChannel(name: "plugins.invisiblewrench.com/flutter_midi_command/disconnect_channel", binaryMessenger: registrar.messenger)
+#else
+        disconnectChannel = FlutterEventChannel(name: "plugins.invisiblewrench.com/flutter_midi_command/disconnect_channel", binaryMessenger: registrar.messenger())
+#endif
+        disconnectChannel?.setStreamHandler(disconnectStreamHandler)
+
         
         // MIDI client with notification handler
         MIDIClientCreateWithBlock("plugins.invisiblewrench.com.FlutterMidiCommand" as CFString, &midiClient) { (notification) in
@@ -127,6 +137,20 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     func updateBluetoothState(data: Any) {
         DispatchQueue.main.async {
             self.bluetoothStateHandler.send(data:data)
+        }
+    }
+
+    func sendDisconnect(info: [String: String?]) {
+        // Omit nil values rather than bridging optionals through the Flutter codec;
+        // the Dart side falls back to the id when the name is missing.
+        var data: [String: Any] = [:]
+        for (key, value) in info {
+            if let value = value {
+                data[key] = value
+            }
+        }
+        DispatchQueue.main.async {
+            self.disconnectStreamHandler.send(data: data)
         }
     }
     
@@ -370,6 +394,7 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         let device = connectedDevices[deviceId]
         print("disconnect \(String(describing: device)) for id \(deviceId)")
         if let device = device {
+            let info = device.disconnectInfo()
             if device.deviceType == "BLE" {
                 let p = (device as! ConnectedBLEDevice).peripheral
                 manager.cancelPeripheralConnection(p)
@@ -384,6 +409,7 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
                 updateSetupState(data: "deviceDisconnected")
             }
             connectedDevices.removeValue(forKey: deviceId)
+            sendDisconnect(info: info)
         }
     }
     
@@ -429,6 +455,67 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     func createPortDict(count:Int) -> Array<Dictionary<String, Any>> {
         return (0..<count).map { (id) -> Dictionary<String, Any> in
             return ["id": id, "connected" : false]
+        }
+    }
+
+    /// Builds the deviceId ("\(device):\(entityIndex)") for a MIDI endpoint,
+    /// matching the id scheme used in getDevices().
+    private func deviceId(forEndpoint endpoint: MIDIEndpointRef) -> String? {
+        var entity : MIDIEntityRef = 0
+        if MIDIEndpointGetEntity(endpoint, &entity) != noErr { return nil }
+        var device : MIDIDeviceRef = 0
+        if MIDIEntityGetDevice(entity, &device) != noErr { return nil }
+        let entityCount = MIDIDeviceGetNumberOfEntities(device)
+        var entityIndex = 0
+        for e in 0..<entityCount {
+            if MIDIDeviceGetEntity(device, e) == entity {
+                entityIndex = e
+            }
+        }
+        return "\(device):\(entityIndex)"
+    }
+
+    /// The set of currently present native (wired/network) device ids.
+    func currentNativeDeviceIds() -> Set<String> {
+        var ids = Set<String>()
+        let destinationCount = MIDIGetNumberOfDestinations()
+        for d in 0..<destinationCount {
+            let destination = MIDIGetDestination(d)
+            if isVirtualEndpoint(endpoint: destination) { continue }
+            if let id = deviceId(forEndpoint: destination) { ids.insert(id) }
+        }
+        let sourceCount = MIDIGetNumberOfSources()
+        for s in 0..<sourceCount {
+            let source = MIDIGetSource(s)
+            if isVirtualEndpoint(endpoint: source) { continue }
+            if let id = deviceId(forEndpoint: source) { ids.insert(id) }
+        }
+        return ids
+    }
+
+    /// Detects connected native/wired devices that have been physically removed
+    /// (e.g. USB unplug) by diffing against the currently present endpoints, and
+    /// emits a disconnect event for each.
+    func handleNativeDeviceRemoval() {
+        // CoreMIDI delivers notifications on an arbitrary thread. Hop to main so
+        // that all access to connectedDevices (and the device teardown) is
+        // serialized with the rest of the plugin, which runs on the main thread.
+        // Deferring also lets the MIDI subsystem settle before we diff the
+        // endpoints, avoiding a false positive from a transient enumeration in
+        // the middle of a setup change.
+        DispatchQueue.main.async {
+            let presentIds = self.currentNativeDeviceIds()
+            let removed = self.connectedDevices.filter { (_, device) in
+                (device.deviceType == "native" || device.deviceType == "network")
+                    && !presentIds.contains(device.id)
+            }
+            for (key, device) in removed {
+                print("native device removed \(device.id)")
+                let info = device.disconnectInfo()
+                device.close()
+                self.connectedDevices.removeValue(forKey: key)
+                self.sendDisconnect(info: info)
+            }
         }
     }
     
@@ -748,9 +835,12 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
                 print("child type \(m.childType)")
                 print("parent \(m.parent)")
                 print("parentType \(m.parentType)")
-                
+
                 //                print("childName \(String(describing: getDisplayName(m.child)))")
             }
+            // A wired/native device may have been physically removed; diff against
+            // the currently present endpoints and notify clients of any drops.
+            handleNativeDeviceRemoval()
             break
             
             // An object's property was changed. Structure is MIDIObjectPropertyChangeNotification.
@@ -916,8 +1006,16 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         print("central didDisconnectPeripheral \(peripheral)")
-        
+
         updateSetupState(data: "deviceDisconnected")
+
+        // Only fires here for unexpected drops; an explicit disconnect has already
+        // removed the entry (and emitted) in disconnectDevice(deviceId:).
+        let uuid = peripheral.identifier.uuidString
+        if let device = connectedDevices[uuid] {
+            connectedDevices.removeValue(forKey: uuid)
+            sendDisconnect(info: device.disconnectInfo())
+        }
     }
 }
 
@@ -966,10 +1064,15 @@ class ConnectedDevice : NSObject {
     }
     
     func openPorts() {}
-    
+
     func send(bytes:[UInt8], timestamp: UInt64?) {}
-    
+
     func close() {}
+
+    /// Device identity sent to clients when the device disconnects.
+    func disconnectInfo() -> [String: String?] {
+        return ["id": id, "name": nil, "type": deviceType]
+    }
 }
 
 class ConnectedVirtualOrNativeDevice : ConnectedDevice {
@@ -994,7 +1097,11 @@ class ConnectedVirtualOrNativeDevice : ConnectedDevice {
         
         super.init(id: id, type: type, streamHandler: streamHandler)
     }
-    
+
+    override func disconnectInfo() -> [String: String?] {
+        return ["id": id, "name": name, "type": deviceType]
+    }
+
     override func send(bytes: [UInt8], timestamp: UInt64?) {
         print("send \(bytes.count) bytes to \(String(describing: name))")
         
@@ -1597,6 +1704,10 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
     override func close() {
         CBCentralManager().cancelPeripheralConnection(peripheral)
         characteristic = nil
+    }
+
+    override func disconnectInfo() -> [String: String?] {
+        return ["id": id, "name": peripheral.name, "type": "BLE"]
     }
     
     override func send(bytes:[UInt8], timestamp: UInt64?) {

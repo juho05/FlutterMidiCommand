@@ -54,6 +54,8 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   late Stream<MidiPacket> _rxStream;
   StreamController<String> _setupStreamController = StreamController<String>.broadcast();
   late Stream<String> _setupStream;
+  StreamController<MidiDevice> _deviceDisconnectedController = StreamController<MidiDevice>.broadcast();
+  late Stream<MidiDevice> _deviceDisconnectedStream;
 
   Map<String, LinuxMidiDevice> _connectedDevices = Map<String, LinuxMidiDevice>();
 
@@ -63,6 +65,18 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   FlutterMidiCommandLinux() {
     _setupStream = _setupStreamController.stream;
     _rxStream = _rxStreamController.stream;
+    _deviceDisconnectedStream = _deviceDisconnectedController.stream;
+
+    // Notify clients when a connected device is unexpectedly removed (e.g. unplugged).
+    AlsaMidiDevice.onDeviceDisconnected.listen((alsaDevice) {
+      var id = AlsaMidiDevice.hardwareId(alsaDevice.cardId, alsaDevice.deviceId);
+      var device = _connectedDevices.remove(id);
+      if (device != null) {
+        device.connected = false;
+        _deviceDisconnectedController.add(device);
+        _setupStreamController.add("deviceDisconnected");
+      }
+    });
   }
 
   /// The linux implementation of [MidiCommandPlatform]
@@ -134,6 +148,7 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       if (remove) {
         _connectedDevices.remove(device.id);
         _setupStreamController.add("deviceDisconnected");
+        _deviceDisconnectedController.add(linuxDevice);
       }
     }
   }
@@ -142,6 +157,8 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   void teardown() {
     _connectedDevices.values.forEach((device) {
       disconnectDevice(device, remove: false);
+      device.connected = false;
+      _deviceDisconnectedController.add(device);
     });
     _connectedDevices.clear();
     _setupStreamController.add("deviceDisconnected");
@@ -173,6 +190,12 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   @override
   Stream<String>? get onMidiSetupChanged {
     return _setupStream;
+  }
+
+  /// Stream firing whenever a connected device disconnects (explicitly or unexpectedly).
+  @override
+  Stream<MidiDevice>? get onMidiDeviceDisconnected {
+    return _deviceDisconnectedStream;
   }
 
   /// Creates a virtual MIDI source

@@ -39,6 +39,8 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
   lateinit var bluetoothStateChannel: EventChannel
   lateinit var bluetoothStateHandler: FMCStreamHandler
   lateinit var rxStreamHandler: FMCStreamHandler
+  lateinit var disconnectChannel: EventChannel
+  lateinit var disconnectStreamHandler: FMCStreamHandler
   var bluetoothState: String = "unknown"
     set(value) {
       bluetoothStateHandler.send(value)
@@ -129,6 +131,10 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
     bluetoothStateHandler = FMCStreamHandler(handler)
     bluetoothStateChannel = EventChannel(messenger, "plugins.invisiblewrench.com/flutter_midi_command/bluetooth_central_state")
     bluetoothStateChannel.setStreamHandler( bluetoothStateHandler )
+
+    disconnectStreamHandler = FMCStreamHandler(handler)
+    disconnectChannel = EventChannel(messenger, "plugins.invisiblewrench.com/flutter_midi_command/disconnect_channel")
+    disconnectChannel.setStreamHandler( disconnectStreamHandler )
   }
 
 
@@ -603,6 +609,7 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
       Log.d("FlutterMIDICommand", "onDeviceOpened")
       it?.also {
         val device = ConnectedDevice(it, this@FlutterMidiCommandPlugin.setupStreamHandler)
+        device.disconnectStreamHandler = this@FlutterMidiCommandPlugin.disconnectStreamHandler
         var result = this@FlutterMidiCommandPlugin.ongoingConnections[device.id]
         device.connectWithStreamHandler(rxStreamHandler, result)
 
@@ -627,8 +634,10 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
       device?.also {
         Log.d("FlutterMIDICommand","MIDI device removed $it")
         var id = Device.deviceIdForInfo(it)
-        connectedDevices[id]?.also {
-          Log.d("FlutterMIDICommand","remove removed device $it")
+        connectedDevices[id]?.also { removedDevice ->
+          Log.d("FlutterMIDICommand","remove removed device $removedDevice")
+          // close() tears down the (now stale) resources and emits the disconnect event.
+          removedDevice.close()
           connectedDevices.remove(id)
           discoveredDevices.removeIf { discoveredDevice -> discoveredDevice.address == id }
           ongoingConnections.remove(id)

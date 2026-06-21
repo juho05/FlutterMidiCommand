@@ -10,12 +10,15 @@ const EventChannel _setupChannel = EventChannel(
     'plugins.invisiblewrench.com/flutter_midi_command/setup_channel');
 const EventChannel _bluetoothStateChannel = EventChannel(
     'plugins.invisiblewrench.com/flutter_midi_command/bluetooth_central_state');
+const EventChannel _disconnectChannel = EventChannel(
+    'plugins.invisiblewrench.com/flutter_midi_command/disconnect_channel');
 
 /// An implementation of [MidiCommandPlatform] that uses method channels.
 class MethodChannelMidiCommand extends MidiCommandPlatform {
   Stream<MidiPacket>? _rxStream;
   Stream<String>? _setupStream;
   Stream<String>? _bluetoothStateStream;
+  Stream<MidiDevice>? _disconnectStream;
 
   /// Returns a list of found MIDI devices.
   @override
@@ -144,6 +147,21 @@ class MethodChannelMidiCommand extends MidiCommandPlatform {
   Stream<String>? get onMidiSetupChanged {
     _setupStream ??= _setupChannel.receiveBroadcastStream().cast<String>();
     return _setupStream;
+  }
+
+  /// Stream firing events whenever a connected device disconnects.
+  ///
+  /// The event contains the [MidiDevice] that disconnected.
+  @override
+  Stream<MidiDevice>? get onMidiDeviceDisconnected {
+    _disconnectStream ??=
+        _disconnectChannel.receiveBroadcastStream().map<MidiDevice>((d) {
+      var dd = (d as Map);
+      var name = dd["name"] ?? dd["id"];
+      return MidiDevice(
+          dd["id"].toString(), name.toString(), dd["type"].toString(), false);
+    });
+    return _disconnectStream;
   }
 
   /// Creates a virtual MIDI source

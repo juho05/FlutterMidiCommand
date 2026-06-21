@@ -25,6 +25,10 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       StreamController<String>.broadcast();
   late Stream<String> _bluetoothStateStream;
 
+  StreamController<MidiDevice> _deviceDisconnectedController =
+      StreamController<MidiDevice>.broadcast();
+  late Stream<MidiDevice> _deviceDisconnectedStream;
+
   Map<String, WindowsMidiDevice> _connectedDevices =
       Map<String, WindowsMidiDevice>();
 
@@ -46,6 +50,7 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
     _setupStream = _setupStreamController.stream;
     _rxStream = _rxStreamController.stream;
     _bluetoothStateStream = _bluetoothStateStreamController.stream;
+    _deviceDisconnectedStream = _deviceDisconnectedController.stream;
 
     _setupDeviceManager();
   }
@@ -59,6 +64,7 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
           _setupStreamController.add("deviceAppeared");
         } else if (event.eventType == EventType.remove) {
           _setupStreamController.add("deviceDisappeared");
+          _handleNativeDeviceRemoval();
         }
       }
     });
@@ -181,8 +187,16 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
               BleConnectionState.connected;
           _setupStreamController.add('deviceConnected');
         } else {
-          _discoveredBLEDevices.remove(deviceId);
-          _setupStreamController.add('deviceDisconnected');
+          // Only treat this as a disconnect if we were actually connected, so we
+          // don't emit for a discovered-but-never-connected device that drops.
+          // Keep the device in the discovered list so it stays reconnectable
+          // without requiring a new scan.
+          var device = _discoveredBLEDevices[deviceId];
+          if (device != null && device.connected) {
+            device.connected = false;
+            _setupStreamController.add('deviceDisconnected');
+            _deviceDisconnectedController.add(device);
+          }
         }
       }
     };
@@ -256,6 +270,7 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
         if (result) {
           _connectedDevices.remove(device.id);
           _setupStreamController.add("deviceDisconnected");
+          _deviceDisconnectedController.add(windowsDevice);
         } else {
           print("failed to close $windowsDevice");
         }
@@ -323,6 +338,12 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
     return _setupStream;
   }
 
+  /// Stream firing whenever a connected device disconnects (explicitly or unexpectedly).
+  @override
+  Stream<MidiDevice>? get onMidiDeviceDisconnected {
+    return _deviceDisconnectedStream;
+  }
+
   /// Creates a virtual MIDI source
   ///
   /// The virtual MIDI source appears as a virtual port in other apps.
@@ -358,6 +379,70 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       }
     }
     return null;
+  }
+
+  /// Enumerates the ids of currently present native MIDI devices, using the same
+  /// id/dedup scheme as [devices].
+  Set<String> _presentNativeDeviceIds() {
+    var ids = <String>{};
+
+    Pointer<MIDIINCAPS> inCaps = malloc<MIDIINCAPS>();
+    int nIn = midiInGetNumDevs();
+    Map<String, int> deviceInputs = {};
+    for (int i = 0; i < nIn; ++i) {
+      midiInGetDevCaps(i, inCaps, sizeOf<MIDIINCAPS>());
+      var name = inCaps.ref.szPname;
+      var id = name;
+      if (!deviceInputs.containsKey(name)) {
+        deviceInputs[name] = 0;
+      } else {
+        deviceInputs[name] = deviceInputs[name]! + 1;
+      }
+      if (deviceInputs[name]! > 0) {
+        id = id + " (${deviceInputs[name]})";
+      }
+      ids.add(id);
+    }
+    free(inCaps);
+
+    Pointer<MIDIOUTCAPS> outCaps = malloc<MIDIOUTCAPS>();
+    int nOut = midiOutGetNumDevs();
+    Map<String, int> deviceOutputs = {};
+    for (int i = 0; i < nOut; ++i) {
+      midiOutGetDevCaps(i, outCaps, sizeOf<MIDIOUTCAPS>());
+      var name = outCaps.ref.szPname;
+      var id = name;
+      if (!deviceOutputs.containsKey(name)) {
+        deviceOutputs[name] = 0;
+      } else {
+        deviceOutputs[name] = deviceOutputs[name]! + 1;
+      }
+      if (deviceOutputs[name]! > 0) {
+        id = id + " (${deviceOutputs[name]})";
+      }
+      ids.add(id);
+    }
+    free(outCaps);
+
+    return ids;
+  }
+
+  /// Detects connected native devices that have been physically removed (e.g. USB
+  /// unplug) by diffing against the currently present devices, and notifies clients.
+  void _handleNativeDeviceRemoval() {
+    var presentIds = _presentNativeDeviceIds();
+    var removed = _connectedDevices.keys
+        .where((id) => !presentIds.contains(id))
+        .toList();
+    for (var id in removed) {
+      var device = _connectedDevices.remove(id);
+      if (device != null) {
+        device.disconnect();
+        device.connected = false;
+        _deviceDisconnectedController.add(device);
+        _setupStreamController.add("deviceDisconnected");
+      }
+    }
   }
   //#endregion
 }

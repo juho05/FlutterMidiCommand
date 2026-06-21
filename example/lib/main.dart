@@ -19,7 +19,11 @@ class MyApp extends StatefulWidget {
 class MyAppState extends State<MyApp> {
   StreamSubscription<String>? _setupSubscription;
   StreamSubscription<BluetoothState>? _bluetoothStateSubscription;
+  StreamSubscription<MidiDevice>? _deviceDisconnectedSubscription;
   final MidiCommand _midiCommand = MidiCommand();
+
+  final GlobalKey<ScaffoldMessengerState> _scaffoldMessengerKey =
+      GlobalKey<ScaffoldMessengerState>();
 
   bool _virtualDeviceActivated = false;
   bool _iOSNetworkSessionEnabled = false;
@@ -45,6 +49,18 @@ class MyAppState extends State<MyApp> {
       setState(() {});
     });
 
+    _deviceDisconnectedSubscription =
+        _midiCommand.onMidiDeviceDisconnected?.listen((device) {
+      if (kDebugMode) {
+        print("device disconnected ${device.name} (${device.id})");
+      }
+      _scaffoldMessengerKey.currentState?.showSnackBar(SnackBar(
+        backgroundColor: Colors.orange,
+        content: Text("Device disconnected: ${device.name}"),
+      ));
+      setState(() {});
+    });
+
     _updateNetworkSessionState();
   }
 
@@ -52,6 +68,7 @@ class MyAppState extends State<MyApp> {
   void dispose() {
     _setupSubscription?.cancel();
     _bluetoothStateSubscription?.cancel();
+    _deviceDisconnectedSubscription?.cancel();
     super.dispose();
   }
 
@@ -113,6 +130,7 @@ class MyAppState extends State<MyApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      scaffoldMessengerKey: _scaffoldMessengerKey,
       home: Scaffold(
         appBar: AppBar(
           title: const Text('FlutterMidiCommand Example'),

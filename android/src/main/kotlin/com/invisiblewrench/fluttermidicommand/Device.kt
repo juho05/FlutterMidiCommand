@@ -12,6 +12,11 @@ abstract class Device {
     lateinit var midiDevice: MidiDevice
     protected var receiver:MidiReceiver? = null
     protected var setupStreamHandler: FMCStreamHandler? = null
+    var disconnectStreamHandler: FMCStreamHandler? = null
+
+    /// Device identity sent to clients when the device disconnects.
+    open val deviceInfo: Map<String, Any?>
+        get() = mapOf("id" to id, "name" to null, "type" to type)
 
     constructor(id: String, type: String) {
         this.id = id

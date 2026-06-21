@@ -104,6 +104,15 @@ abstract class MidiCommandPlatform extends PlatformInterface {
         'get onMidiSetupChanged has not been implemented.');
   }
 
+  /// Stream firing events whenever a connected device disconnects.
+  ///
+  /// Fires for both explicit disconnects and unexpected drops (for example
+  /// when a wired device is unplugged or a BLE device goes out of range).
+  Stream<MidiDevice>? get onMidiDeviceDisconnected {
+    throw UnimplementedError(
+        'get onMidiDeviceDisconnected has not been implemented.');
+  }
+
   /// Creates a virtual MIDI source.
   void addVirtualDevice({String? name}) {
     throw UnimplementedError('addVirtualDevice() has not been implemented.');

@@ -158,6 +158,15 @@ class MidiCommand {
     return _platform.onMidiSetupChanged;
   }
 
+  /// Stream firing whenever a connected device disconnects.
+  ///
+  /// Fires for both explicit disconnects and unexpected drops (for example
+  /// when a wired device is unplugged or a BLE device goes out of range).
+  /// The event contains the [MidiDevice] that disconnected.
+  Stream<MidiDevice>? get onMidiDeviceDisconnected {
+    return _platform.onMidiDeviceDisconnected;
+  }
+
   /// Stream firing events whenever a midi package is sent
   ///
   /// The event contains the raw bytes contained in the MIDI package
