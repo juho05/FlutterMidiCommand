@@ -8,3 +8,7 @@ pubspec.lock
 build/
 local.properties
 .idea/
+
+# Swift Package Manager
+.build/
+.swiftpm/

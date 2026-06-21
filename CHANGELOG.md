@@ -1,3 +1,18 @@
+## 0.6.0
+**Swift Package Manager support and UIScene lifecycle migration (Flutter 3.38–3.44)**
+- Added Swift Package Manager support for iOS and macOS alongside CocoaPods. The native
+  Darwin code now lives in a shared `darwin/` directory (`sharedDarwinSource`) with a
+  single `Package.swift` and podspec.
+- iOS is now a pure-Swift plugin: the Objective-C registration shim was removed and the
+  iOS `pluginClass` is now `SwiftFlutterMidiCommandPlugin` (was `FlutterMidiCommandPlugin`).
+- Raised minimum deployment targets to iOS 13.0 / macOS 10.15 and SDK constraints to
+  Flutter `>=3.41.0` / Dart `^3.11.0`, as required by Swift Package Manager.
+- Migrated the example iOS app to the UIScene lifecycle (`FlutterImplicitEngineDelegate`
+  with plugin registration in `didInitializeImplicitFlutterEngine`, `FlutterSceneDelegate`
+  via an Application Scene Manifest in `Info.plist`).
+- The plugin itself uses no iOS application-lifecycle events, so no scene-lifecycle
+  delegate changes were needed in the plugin. Android, Linux, and Windows are unaffected.
+
 ## 0.5.4
 **Critical ANR Fix for Android**
 Fixed Application Not Responding (ANR) issue when connecting to MIDI devices on Android 15 and certain devices (e.g., Lenovo Tab M11).
