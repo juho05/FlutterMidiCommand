@@ -11,7 +11,6 @@
   with plugin registration in `didInitializeImplicitFlutterEngine`, `FlutterSceneDelegate`
   via an Application Scene Manifest in `Info.plist`).
 - Migrated the Android build to Flutter's built-in Kotlin, required by Flutter 3.44.
-
 ## 0.5.4
 MR #137, #138, Added timestamps to messages.
 MR #142, Fix MIDI Listener issue.
