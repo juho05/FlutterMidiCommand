@@ -1,0 +1,36 @@
+# ffigen config for the vendored Linux/ALSA bindings.
+# Regenerate with:  dart run ffigen --config ffigen_alsa.yaml
+# Mirrors the rename rules used by the upstream `midi` package so the generated
+# symbol names match the vendored alsa_midi_device.dart (e.g. `snd_rawmidi_`).
+name: "ALSA"
+description: "Dart bindings to ALSA, generated for flutter_midi_command (Linux)."
+output: "lib/src/alsa/alsa_generated_bindings.dart"
+# Silence analyzer warnings for the many unused libc helper declarations that
+# the ALSA headers pull in (the auto-added `type=lint` ignore doesn't cover
+# warning-severity diagnostics like unused_element).
+preamble: |
+  // ignore_for_file: unused_element, unused_field
+headers:
+  entry-points:
+    - "/usr/include/alsa/asoundlib.h"
+compiler-opts:
+  - "-Wno-nullability-completeness"
+  # Point clang at its own builtin headers (stddef.h etc.). Adjust the version
+  # path if regenerating on a machine with a different clang. `clang
+  # -print-resource-dir` prints the right base directory.
+  - "-I/usr/lib/clang/22/include"
+structs:
+  rename:
+    "_(.*)": "$1_"
+  member-rename:
+    ".*":
+      "_(.*)": "$1_"
+# Generate enums as plain integer constants rather than native Dart enums.
+# This matches the int-based API the vendored alsa_midi_device.dart uses (it
+# passes ints such as SND_RAWMIDI_STREAM_INPUT for stream parameters) and avoids
+# a name collision between the `_snd_pcm_stream` enum and the `snd_pcm_stream()`
+# function's generated private binding.
+enums:
+  as-int:
+    include:
+      - ".*"

@@ -12,9 +12,7 @@ dependencies:
   flutter:
     sdk: flutter
   plugin_platform_interface: ^2.0.0
-  # Linux (ALSA) implementation
-  midi: ^0.1.0
-  # Windows implementation
+  # Linux (ALSA) and Windows (win32) implementations
   ffi: ^2.1.4
   win32: ^5.14.0
   universal_ble: ^0.21.0
@@ -24,6 +22,8 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  # Used to (re)generate the vendored ALSA bindings: dart run ffigen --config ffigen_alsa.yaml
+  ffigen: ^18.0.0
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

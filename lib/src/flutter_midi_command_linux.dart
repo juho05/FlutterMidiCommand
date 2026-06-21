@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'package:midi/midi.dart';
 import 'dart:typed_data';
+import 'alsa/alsa_midi_device.dart';
 import 'midi_command_platform_interface.dart';
 
 class LinuxMidiDevice extends MidiDevice {
@@ -8,6 +8,7 @@ class LinuxMidiDevice extends MidiDevice {
   int cardId;
   int deviceId;
   AlsaMidiDevice _device;
+  StreamSubscription? _rxSubscription;
 
   LinuxMidiDevice(this._device, this.cardId, this.deviceId, String name, String type,
       this._rxStreamCtrl, bool connected)
@@ -29,11 +30,15 @@ class LinuxMidiDevice extends MidiDevice {
   }
 
   Future<bool> connect() async {
-    await _device.connect();
+    final success = await _device.connect();
+    if (!success) {
+      connected = false;
+      return false;
+    }
     connected = true;
 
     // connect up incoming alsa midi data to our rx stream of MidiPackets
-    _device.receivedMessages.listen((event) {
+    _rxSubscription = _device.receivedMessages.listen((event) {
       _rxStreamCtrl.add(MidiPacket(event.data, event.timestamp, this));
     });
     return true;
@@ -44,6 +49,8 @@ class LinuxMidiDevice extends MidiDevice {
   }
 
   disconnect() {
+    _rxSubscription?.cancel();
+    _rxSubscription = null;
     _device.disconnect();
     connected = false;
   }
@@ -59,20 +66,23 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
 
   Map<String, LinuxMidiDevice> _connectedDevices = Map<String, LinuxMidiDevice>();
 
-  final List<AlsaMidiDevice> _allAlsaDevices = [];
-
   /// A constructor that allows tests to override the window object used by the plugin.
   FlutterMidiCommandLinux() {
     _setupStream = _setupStreamController.stream;
     _rxStream = _rxStreamController.stream;
     _deviceDisconnectedStream = _deviceDisconnectedController.stream;
 
-    // Notify clients when a connected device is unexpectedly removed (e.g. unplugged).
+    // Notify clients when a connected device is unexpectedly removed (e.g.
+    // unplugged). For an explicit disconnect the device has already been removed
+    // from [_connectedDevices] (and the event emitted) in disconnectDevice, so
+    // this only fires for unexpected drops.
     AlsaMidiDevice.onDeviceDisconnected.listen((alsaDevice) {
       var id = AlsaMidiDevice.hardwareId(alsaDevice.cardId, alsaDevice.deviceId);
       var device = _connectedDevices.remove(id);
       if (device != null) {
-        device.connected = false;
+        // The underlying ALSA device is already torn down; this just cancels our
+        // rx subscription and marks the wrapper disconnected.
+        device.disconnect();
         _deviceDisconnectedController.add(device);
         _setupStreamController.add("deviceDisconnected");
       }
@@ -89,10 +99,10 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
 
   @override
   Future<List<MidiDevice>> get devices async {
-    if (_allAlsaDevices.isEmpty) {
-      _allAlsaDevices.addAll(AlsaMidiDevice.getDevices());
-    }
-    return _allAlsaDevices
+    // Enumerate fresh each time so unplugged/replugged devices aren't served
+    // from a stale cache. getDevices() already returns the live objects for
+    // currently-connected devices, so connections are preserved.
+    return AlsaMidiDevice.getDevices()
         .map(
           (alsMidiDevice) => LinuxMidiDevice(
             alsMidiDevice,
@@ -142,8 +152,11 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   /// Disconnects from the device.
   @override
   void disconnectDevice(MidiDevice device, {bool remove = true}) {
-    if (_connectedDevices.containsKey(device.id)) {
-      var linuxDevice = device as LinuxMidiDevice;
+    // Operate on the stored connected device, not the passed-in wrapper, which
+    // may be a fresh instance from a later devices() enumeration wrapping the
+    // same underlying device.
+    var linuxDevice = _connectedDevices[device.id];
+    if (linuxDevice != null) {
       linuxDevice.disconnect();
       if (remove) {
         _connectedDevices.remove(device.id);
