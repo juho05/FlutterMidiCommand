@@ -1,19 +1,17 @@
 plugins {
     id("com.android.library")
-    id("kotlin-android")
 }
 
 rootProject.allprojects {
     repositories {
         google()
-        jcenter()
         mavenCentral()
     }
 }
 
 android {
-    namespace = "com.invisiblewrench.flutter_midi_command_example"
-    compileSdk = 34 // use flutter.compileSdkVersion  when Flutter 3.27.0 is widely used
+    namespace = "com.invisiblewrench.fluttermidicommand"
+    compileSdk = flutter.compileSdkVersion
 
     sourceSets {
         getByName("main").java.srcDirs("src/main/kotlin")
@@ -23,8 +21,9 @@ android {
         minSdkVersion(21)
     }
 
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_1_8.toString()
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 
     dependencies {
@@ -32,6 +31,12 @@ android {
         implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
         testImplementation("org.jetbrains.kotlin:kotlin-test")
         testImplementation("org.mockito:mockito-core:5.0.0")
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11
     }
 }
 

@@ -6,13 +6,11 @@
 - iOS is now a pure-Swift plugin: the Objective-C registration shim was removed and the
   iOS `pluginClass` is now `SwiftFlutterMidiCommandPlugin` (was `FlutterMidiCommandPlugin`).
 - Raised minimum deployment targets to iOS 13.0 / macOS 10.15 and SDK constraints to
-  Flutter `>=3.41.0` / Dart `^3.11.0`, as required by Swift Package Manager.
+  Flutter `>=3.44.0` / Dart `^3.12.0`.
 - Migrated the example iOS app to the UIScene lifecycle (`FlutterImplicitEngineDelegate`
   with plugin registration in `didInitializeImplicitFlutterEngine`, `FlutterSceneDelegate`
   via an Application Scene Manifest in `Info.plist`).
-- The plugin itself uses no iOS application-lifecycle events, so no scene-lifecycle
-  delegate changes were needed in the plugin. Android, Linux, and Windows are unaffected.
-
+- Migrated the Android build to Flutter's built-in Kotlin, required by Flutter 3.44.
 ## 0.5.4
 **Critical ANR Fix for Android**
 Fixed Application Not Responding (ANR) issue when connecting to MIDI devices on Android 15 and certain devices (e.g., Lenovo Tab M11).
