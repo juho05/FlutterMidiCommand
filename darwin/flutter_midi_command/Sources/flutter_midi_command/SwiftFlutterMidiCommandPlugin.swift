@@ -1,8 +1,10 @@
 
 #if os(macOS)
 import FlutterMacOS
+import AppKit
 #else
 import Flutter
+import UIKit
 #endif
 
 import CoreMIDI
@@ -121,7 +123,22 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         MIDIClientCreateWithBlock("plugins.invisiblewrench.com.FlutterMidiCommand" as CFString, &midiClient) { (notification) in
             self.handleMIDINotification(notification)
         }
-        
+
+        // Reconcile connected devices whenever the app becomes active again.
+        // While suspended, CoreMIDI's setup-changed notification and
+        // CoreBluetooth's didDisconnectPeripheral callback may not be delivered,
+        // leaving a stale "connected" device behind. Diffing on activation
+        // guarantees a disconnect event is emitted for anything that vanished
+        // while we were backgrounded.
+#if os(iOS)
+        // Modern UIScene lifecycle (Flutter 3.44+ scene-based embedding):
+        // UIApplication.didBecomeActiveNotification is not the right signal once
+        // scenes are adopted, so observe the per-scene activation notification.
+        NotificationCenter.default.addObserver(self, selector: #selector(reconcileConnectedDevices), name: UIScene.didActivateNotification, object: nil)
+#elseif os(macOS)
+        NotificationCenter.default.addObserver(self, selector: #selector(reconcileConnectedDevices), name: NSApplication.didBecomeActiveNotification, object: nil)
+#endif
+
 #if os(iOS)
         session = MIDINetworkSession.default()
         session?.connectionPolicy = MIDINetworkConnectionPolicy.anyone
@@ -203,8 +220,15 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     // BLE
     public func startBluetoothCentralWhenNeeded(){
         if(manager == nil){
-            manager = CBCentralManager.init(delegate: self, queue: DispatchQueue.global(qos: .userInteractive))
-            
+            // Deliver all CoreBluetooth events on the main queue (passing nil uses
+            // the main queue). This serializes every access to the shared
+            // connectedDevices / discoveredDevices state with the rest of the
+            // plugin (method-channel handlers, CoreMIDI-driven reconciliation),
+            // which also runs on main, so there is no cross-thread data race and
+            // the disconnect bookkeeping stays idempotent. It additionally ensures
+            // FlutterResult/FlutterEventSink callbacks fire on the platform thread.
+            manager = CBCentralManager.init(delegate: self, queue: nil)
+
             updateBluetoothState(data: getBluetoothCentralStateAsString())
         }
     }
@@ -518,8 +542,40 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
             }
         }
     }
-    
-    
+
+    /// Detects connected BLE devices whose peripheral is no longer connected
+    /// (e.g. moved out of range while the app was suspended, where
+    /// didDisconnectPeripheral may not have been delivered) and emits a
+    /// disconnect event for each.
+    func handleBLEDeviceRemoval() {
+        DispatchQueue.main.async {
+            let removed = self.connectedDevices.filter { (_, device) in
+                guard device.deviceType == "BLE",
+                      let ble = device as? ConnectedBLEDevice else { return false }
+                return ble.peripheral.state == .disconnected
+            }
+            for (key, device) in removed {
+                print("ble device removed \(device.id)")
+                let info = device.disconnectInfo()
+                if let ble = device as? ConnectedBLEDevice {
+                    self.manager.cancelPeripheralConnection(ble.peripheral)
+                }
+                device.close()
+                self.connectedDevices.removeValue(forKey: key)
+                self.sendDisconnect(info: info)
+            }
+        }
+    }
+
+    /// Reconciles all connected devices against the system's live state. Invoked
+    /// on app/scene activation so that a device which disconnected while we were
+    /// backgrounded still produces a disconnect event, leaving no stale entries.
+    @objc func reconcileConnectedDevices() {
+        handleNativeDeviceRemoval()
+        handleBLEDeviceRemoval()
+    }
+
+
     func getDevices() -> [Dictionary<String, Any>] {
         var devices:[Dictionary<String, Any>] = []
         
@@ -1009,8 +1065,10 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
 
         updateSetupState(data: "deviceDisconnected")
 
-        // Only fires here for unexpected drops; an explicit disconnect has already
-        // removed the entry (and emitted) in disconnectDevice(deviceId:).
+        // Runs on main (the manager's delivery queue), serialized with
+        // disconnectDevice / handleNativeDeviceRemoval / handleBLEDeviceRemoval.
+        // The check-remove-emit is therefore atomic: only whichever path runs
+        // first emits, any later one finds the entry already gone and is ignored.
         let uuid = peripheral.identifier.uuidString
         if let device = connectedDevices[uuid] {
             connectedDevices.removeValue(forKey: uuid)

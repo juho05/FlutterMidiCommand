@@ -2,6 +2,7 @@ package com.invisiblewrench.fluttermidicommand
 
 import android.Manifest
 import android.app.Activity
+import android.app.Application
 import android.bluetooth.*
 import android.bluetooth.BluetoothGatt.*
 import android.bluetooth.BluetoothProfile.*
@@ -63,6 +64,10 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
   }
 
   override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+    if (lifecycleCallbacksRegistered) {
+      (context.applicationContext as? Application)?.unregisterActivityLifecycleCallbacks(activityLifecycleCallbacks)
+      lifecycleCallbacksRegistered = false
+    }
     teardownChannels()
   }
 
@@ -135,6 +140,51 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
     disconnectStreamHandler = FMCStreamHandler(handler)
     disconnectChannel = EventChannel(messenger, "plugins.invisiblewrench.com/flutter_midi_command/disconnect_channel")
     disconnectChannel.setStreamHandler( disconnectStreamHandler )
+
+    // Reconcile connected devices whenever the app returns to the foreground.
+    // While the process is backgrounded/suspended the one-shot onDeviceRemoved
+    // callback may never be delivered (or replayed on resume), which would leave
+    // a stale "connected" device behind. Diffing on resume guarantees a
+    // disconnect event is emitted for anything that vanished while we were away.
+    if (!lifecycleCallbacksRegistered) {
+      (context.applicationContext as? Application)?.registerActivityLifecycleCallbacks(activityLifecycleCallbacks)
+      lifecycleCallbacksRegistered = true
+    }
+  }
+
+  /// Diffs the currently connected devices against the devices the system still
+  /// reports as present, emitting a disconnect for any that have disappeared.
+  /// midiManager.devices contains BLE MIDI devices (keyed by their bluetooth
+  /// address) as well as native/USB devices, matching the id scheme used as keys
+  /// in [connectedDevices].
+  private fun reconcileConnectedDevices() {
+    if (!isSupported || !::midiManager.isInitialized) return
+
+    val presentIds = midiManager.devices.map { Device.deviceIdForInfo(it) }.toSet()
+    val removed = connectedDevices.filterKeys { !presentIds.contains(it) }
+    removed.forEach { (id, device) ->
+      Log.d("FlutterMIDICommand", "reconcile: device $id no longer present, disconnecting")
+      // close() tears down the (now stale) resources and emits the disconnect event.
+      device.close()
+      connectedDevices.remove(id)
+      discoveredDevices.removeIf { discoveredDevice -> discoveredDevice.address == id }
+      ongoingConnections.remove(id)
+    }
+  }
+
+  private var lifecycleCallbacksRegistered = false
+
+  private val activityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+    override fun onActivityResumed(activity: Activity) {
+      reconcileConnectedDevices()
+    }
+
+    override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+    override fun onActivityStarted(activity: Activity) {}
+    override fun onActivityPaused(activity: Activity) {}
+    override fun onActivityStopped(activity: Activity) {}
+    override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+    override fun onActivityDestroyed(activity: Activity) {}
   }
 
 
