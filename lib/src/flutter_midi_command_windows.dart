@@ -268,14 +268,21 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
         var windowsDevice = _connectedDevices[device.id]!;
         var result = windowsDevice.disconnect();
         if (result) {
-          _connectedDevices.remove(device.id);
-          _setupStreamController.add("deviceDisconnected");
-          _deviceDisconnectedController.add(windowsDevice);
+          // For an explicit disconnect remove the device from the connected map
+          // and notify. When called from teardown (remove: false) the map is
+          // being iterated and cleared by the caller, so skip the mutation here
+          // to avoid a ConcurrentModificationError.
+          if (remove) {
+            _connectedDevices.remove(device.id);
+            _setupStreamController.add("deviceDisconnected");
+            _deviceDisconnectedController.add(windowsDevice);
+          }
         } else {
           print("failed to close $windowsDevice");
         }
       }
     } else if (device is BLEMidiDevice) {
+      // The disconnect event is emitted from the onConnectionChange callback.
       device.disconnect();
     }
   }
@@ -285,10 +292,24 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
     // Close callback isolate
     _midiCB.close();
 
+    // Disconnect native devices. Pass remove: false so disconnectDevice does not
+    // mutate _connectedDevices while we iterate it; the map is cleared afterwards
+    // and the disconnect event is emitted here per device.
     _connectedDevices.values.forEach((device) {
       disconnectDevice(device, remove: false);
+      device.connected = false;
+      _deviceDisconnectedController.add(device);
     });
     _connectedDevices.clear();
+
+    // Disconnect any connected BLE devices as well. Their disconnect event is
+    // emitted from the onConnectionChange callback.
+    _discoveredBLEDevices.values
+        .where((device) => device.connected)
+        .forEach((device) {
+      disconnectDevice(device, remove: false);
+    });
+
     _setupStreamController.add("deviceDisconnected");
     _rxStreamController.close();
   }
