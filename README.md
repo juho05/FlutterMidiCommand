@@ -5,10 +5,10 @@ A Flutter plugin for sending and receiving MIDI messages between Flutter and phy
 Wraps CoreMIDI/android.media.midi/ALSA/win32 in a thin dart/flutter layer.
 Supports
 
-| Transports | iOS | macos | Android | Linux | Windows |
-|---|---|---|---|---|---|
+| Transports | iOS | macos | Android | Linux   | Windows |
+|---|---|---|---|---------|---|
 | USB | &check; | &check; | &check; | &check; | &check; |
-| BLE | &check; | &check; | &check; | &cross; | &check; |
+| BLE | &check; | &check; | &check; | &check; | &check; |
 | Virtual | &check; | &check; | &check; | &cross; | &cross; |
 | Network Session | &check; | &check; | &cross; | &cross; | &cross; |
 
@@ -19,7 +19,7 @@ Supports
 - Add flutter_midi_command: ^0.5.1 to your pubspec.yaml file.
 - In ios/Podfile uncomment and change the platform to 11.0 `platform :ios, '11.0'`
 - On iOS, After building, Add a NSBluetoothAlwaysUsageDescription and NSLocalNetworkUsageDescription to info.plist in the generated Xcode project.
-- On Linux, make sure ALSA is installed.
+- On Linux, make sure ALSA is installed. For BLE MIDI, BlueZ must be installed and the `bluetoothd` service running.
 
 ## Getting Started
 

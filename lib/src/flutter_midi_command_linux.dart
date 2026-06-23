@@ -1,6 +1,11 @@
 import 'dart:async';
 import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
+import 'package:universal_ble/universal_ble.dart';
+
 import 'alsa/alsa_midi_device.dart';
+import 'ble_midi_device.dart';
 import 'midi_command_platform_interface.dart';
 
 class LinuxMidiDevice extends MidiDevice {
@@ -64,13 +69,20 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   StreamController<MidiDevice> _deviceDisconnectedController = StreamController<MidiDevice>.broadcast();
   late Stream<MidiDevice> _deviceDisconnectedStream;
 
+  StreamController<String> _bluetoothStateStreamController = StreamController<String>.broadcast();
+  late Stream<String> _bluetoothStateStream;
+
   Map<String, LinuxMidiDevice> _connectedDevices = Map<String, LinuxMidiDevice>();
+
+  String _bleState = "unknown";
+  Map<String, BLEMidiDevice> _discoveredBLEDevices = {};
 
   /// A constructor that allows tests to override the window object used by the plugin.
   FlutterMidiCommandLinux() {
     _setupStream = _setupStreamController.stream;
     _rxStream = _rxStreamController.stream;
     _deviceDisconnectedStream = _deviceDisconnectedController.stream;
+    _bluetoothStateStream = _bluetoothStateStreamController.stream;
 
     // Notify clients when a connected device is unexpectedly removed (e.g.
     // unplugged). For an explicit disconnect the device has already been removed
@@ -102,8 +114,8 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
     // Enumerate fresh each time so unplugged/replugged devices aren't served
     // from a stale cache. getDevices() already returns the live objects for
     // currently-connected devices, so connections are preserved.
-    return AlsaMidiDevice.getDevices()
-        .map(
+    List<MidiDevice> devices = AlsaMidiDevice.getDevices()
+        .map<MidiDevice>(
           (alsMidiDevice) => LinuxMidiDevice(
             alsMidiDevice,
             alsMidiDevice.cardId,
@@ -116,28 +128,123 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
           ),
         )
         .toList();
+
+    // Append BLE devices discovered/connected via the (cross-platform)
+    // universal_ble backend, which uses BlueZ on Linux.
+    devices.addAll(_discoveredBLEDevices.values);
+
+    return devices;
   }
 
 
   /// Prepares Bluetooth system
-  @override Future<void> startBluetoothCentral() async {
-    return Future.error("Not available on linux");
+  ///
+  /// On Linux this drives the BlueZ stack through the (cross-platform)
+  /// universal_ble backend. Requires a running bluetoothd.
+  @override
+  Future<void> startBluetoothCentral() async {
+    UniversalBle.timeout = const Duration(seconds: 10);
+
+    UniversalBle.onAvailabilityChange = (state) {
+      _bleState = state.name;
+      _bluetoothStateStreamController.add(state.name);
+    };
+
+    UniversalBle.onScanResult = (result) {
+      if (!_discoveredBLEDevices.containsKey(result.deviceId)) {
+        if (result.name != null) {
+          debugPrint(
+              "${result.name} ${result.deviceId} ${result.manufacturerDataList.map((e) => e.toString()).join(', ')}");
+          _discoveredBLEDevices[result.deviceId] =
+              BLEMidiDevice(result.deviceId, result.name!, _rxStreamController);
+          _setupStreamController.add('deviceAppeared');
+        }
+      }
+    };
+
+    UniversalBle.onConnectionChange = (deviceId, isConnected, error) {
+      if (_discoveredBLEDevices.containsKey(deviceId)) {
+        if (isConnected) {
+          _discoveredBLEDevices[deviceId]!.connectionState =
+              BleConnectionState.connected;
+          _setupStreamController.add('deviceConnected');
+        } else {
+          // Only treat this as a disconnect if we were actually connected, so we
+          // don't emit for a discovered-but-never-connected device that drops.
+          // Keep the device in the discovered list so it stays reconnectable
+          // without requiring a new scan.
+          var device = _discoveredBLEDevices[deviceId];
+          if (device != null && device.connected) {
+            device.connected = false;
+            _setupStreamController.add('deviceDisconnected');
+            _deviceDisconnectedController.add(device);
+          }
+        }
+      }
+    };
+
+    UniversalBle.onValueChange = (deviceId, characteristicId, Uint8List data) {
+      if (_discoveredBLEDevices.containsKey(deviceId)) {
+        _discoveredBLEDevices[deviceId]!.handleData(data);
+      }
+    };
+
+    UniversalBle.onPairingStateChange = (deviceId, isPaired) {
+      if (_discoveredBLEDevices.containsKey(deviceId)) {
+        _discoveredBLEDevices[deviceId]!.pairingState = isPaired;
+      }
+    };
+  }
+
+  /// Stream firing events whenever a change in bluetooth central state happens
+  @override
+  Stream<String>? get onBluetoothStateChanged {
+    return _bluetoothStateStream;
+  }
+
+  /// Returns the current state of the bluetooth subsystem
+  @override
+  Future<String> bluetoothState() async {
+    return _bleState;
   }
 
   /// Starts scanning for BLE MIDI devices.
   ///
   /// Found devices will be included in the list returned by [devices].
+  @override
   Future<void> startScanningForBluetoothDevices() async {
-    return Future.error("Not available on linux");
+    try {
+      await UniversalBle.startScan(
+          scanFilter: ScanFilter(withServices: [MIDI_SERVICE_ID]));
+    } catch (e) {
+      print(e.toString());
+    }
   }
 
   /// Stops scanning for BLE MIDI devices.
-  void stopScanningForBluetoothDevices() {}
+  @override
+  void stopScanningForBluetoothDevices() {
+    UniversalBle.stopScan();
+
+    // Prune discovered-but-not-connected devices so a later [devices] call no
+    // longer lists BLE peripherals that went out of range while scanning (BLE
+    // provides no "scan result removed" event, so this is the point at which we
+    // know the discovered set is stale). Connected devices are kept since the
+    // active session - data reception and disconnect - relies on their entry
+    // here. Mirrors the Windows backend.
+    _discoveredBLEDevices.removeWhere((_, device) => !device.connected);
+  }
 
   /// Connects to the device.
   @override
   Future<void> connectToDevice(MidiDevice device, {List<MidiPort>? ports}) async {
     print('connect to $device');
+
+    if (device is BLEMidiDevice) {
+      // The connected event is emitted from the onConnectionChange callback.
+      device.connect();
+      return;
+    }
 
     var linuxDevice = device as LinuxMidiDevice;
     final success = await linuxDevice.connect();
@@ -152,6 +259,12 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   /// Disconnects from the device.
   @override
   void disconnectDevice(MidiDevice device, {bool remove = true}) {
+    if (device is BLEMidiDevice) {
+      // The disconnect event is emitted from the onConnectionChange callback.
+      device.disconnect();
+      return;
+    }
+
     // Operate on the stored connected device, not the passed-in wrapper, which
     // may be a fresh instance from a later devices() enumeration wrapping the
     // same underlying device.
@@ -174,6 +287,15 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       _deviceDisconnectedController.add(device);
     });
     _connectedDevices.clear();
+
+    // Disconnect any connected BLE devices as well. Their disconnect event is
+    // emitted from the onConnectionChange callback.
+    _discoveredBLEDevices.values
+        .where((device) => device.connected)
+        .forEach((device) {
+      disconnectDevice(device, remove: false);
+    });
+
     _setupStreamController.add("deviceDisconnected");
     _rxStreamController.close();
   }
@@ -183,10 +305,28 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   /// Data is an UInt8List of individual MIDI command bytes.
   @override
   void sendData(Uint8List data, {int? timestamp, String? deviceId}) {
-    _connectedDevices.values.forEach((device) {
-      // print("send to $device");
-      device.send(data, data.length);
-    });
+    if (deviceId != null) {
+      // Send to a specific device, if present.
+      _connectedDevices[deviceId]?.send(data, data.length);
+
+      _discoveredBLEDevices.values
+          .where((device) => device.deviceId == deviceId)
+          .forEach((device) {
+        device.send(data);
+      });
+    } else {
+      // Send to all connected devices.
+      _connectedDevices.values.forEach((device) {
+        // print("send to $device");
+        device.send(data, data.length);
+      });
+
+      _discoveredBLEDevices.values
+          .where((device) => device.connected)
+          .forEach((device) {
+        device.send(data);
+      });
+    }
   }
 
   /// Stream firing events whenever a midi package is received.

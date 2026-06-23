@@ -162,11 +162,19 @@ class BLEMidiDevice extends MidiDevice {
     if (_midiService != null) {
       _midiCharacteristic = _midiService!.characteristics.where((characteristic) => characteristic.uuid.toUpperCase() == MIDI_CHARACTERISTIC_ID).firstOrNull;
       if (_midiCharacteristic != null) {
-        var isPaired = await UniversalBle.isPaired(deviceId) ?? false;
+        // Subscribe to the MIDI characteristic up front, before (and regardless
+        // of) pairing. BLE-MIDI does not mandate bonding and many peripherals
+        // (the "Just Works" case, common on Linux/BlueZ) deliver notifications
+        // without ever pairing, so gating data reception on a successful pairing
+        // would leave such devices connected but silent. On peripherals that do
+        // require encryption this triggers on-demand authentication or fails
+        // harmlessly (the error is caught in _startNotify); the explicit pair()
+        // below, and the re-subscribe from the pairing-state callback, cover the
+        // bonded case. Subscribing twice is a no-op.
+        _startNotify();
 
-        if (isPaired) {
-          _startNotify();
-        } else {
+        var isPaired = await UniversalBle.isPaired(deviceId) ?? false;
+        if (!isPaired) {
           try {
             await UniversalBle.pair(deviceId);
           } catch (e) {
