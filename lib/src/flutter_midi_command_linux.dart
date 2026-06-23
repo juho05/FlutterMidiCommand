@@ -183,7 +183,7 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       }
     };
 
-    UniversalBle.onValueChange = (deviceId, characteristicId, Uint8List data) {
+    UniversalBle.onValueChange = (deviceId, characteristicId, Uint8List data, int? timestamp) {
       if (_discoveredBLEDevices.containsKey(deviceId)) {
         _discoveredBLEDevices[deviceId]!.handleData(data);
       }
