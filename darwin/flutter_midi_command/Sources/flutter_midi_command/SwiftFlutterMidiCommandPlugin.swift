@@ -281,6 +281,16 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         case "stopScanForDevices":
             startBluetoothCentralWhenNeeded();
             manager.stopScan()
+            // Prune discovered-but-not-connected peripherals so a later
+            // getDevices() call no longer lists BLE devices that went out of
+            // range while scanning (CoreBluetooth provides no "scan result
+            // removed" event, so this is the point at which we know the
+            // discovered set is stale). Connected peripherals are kept so the
+            // active session survives. Mirrors the Android backend, which
+            // prunes the discovered set on scan stop (it can clear the whole
+            // set because it tracks connected devices separately; here
+            // connected peripherals share this set).
+            discoveredDevices = discoveredDevices.filter { connectedDevices.keys.contains($0.identifier.uuidString) }
             break
         case "getDevices":
             let devices = getDevices()

@@ -242,6 +242,16 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   void stopScanningForBluetoothDevices() {
     /// Stops scanning for BLE MIDI devices.
     UniversalBle.stopScan();
+
+    // Prune discovered-but-not-connected devices so a later [devices] call no
+    // longer lists BLE peripherals that went out of range while scanning (BLE
+    // provides no "scan result removed" event, so this is the point at which we
+    // know the discovered set is stale). Connected devices are kept since the
+    // active session - data reception and disconnect - relies on their entry
+    // here. Mirrors the Android backend, which prunes the discovered set on
+    // scan stop (it can clear the whole set because it tracks connected devices
+    // separately; here connected devices live in the same map).
+    _discoveredBLEDevices.removeWhere((_, device) => !device.connected);
   }
 
   /// Connects to the device.
