@@ -94,8 +94,12 @@ class MethodChannelMidiCommand extends MidiCommandPlatform {
   /// Connects to the device.
   @override
   Future<void> connectToDevice(MidiDevice device, {List<MidiPort>? ports}) {
-    return _methodChannel.invokeMethod(
-        'connectToDevice', {"device": device.toDictionary, "ports": ports});
+    // Serialize ports to encodable maps; the raw MidiPort objects can't be sent
+    // through the StandardMessageCodec and would throw for a non-null list.
+    return _methodChannel.invokeMethod('connectToDevice', {
+      "device": device.toDictionary,
+      "ports": ports?.map((p) => p.toDictionary).toList(),
+    });
   }
 
   /// Disconnects from the device.
@@ -129,11 +133,11 @@ class MethodChannelMidiCommand extends MidiCommandPlatform {
     _rxStream ??= _rxChannel.receiveBroadcastStream().map<MidiPacket>((d) {
       var dd = d["device"];
       // print("device data $dd");
-      if (dd["name"] == null) {
-          dd["name"] = dd['id'];
-      }
+      // Fall back to the id when no name is provided, without mutating the
+      // decoded platform message in place.
+      var name = dd["name"] ?? dd["id"];
       var device = MidiDevice(
-          dd['id'], dd["name"], dd["type"], dd["connected"] == "true");
+          dd['id'], name, dd["type"], dd["connected"] == "true");
       return MidiPacket(Uint8List.fromList(List<int>.from(d["data"])),
           d["timestamp"] as int, device);
     });

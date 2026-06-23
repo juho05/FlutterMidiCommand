@@ -15,7 +15,9 @@ class MidiDevice {
       "name": name,
       "id": id,
       "type": type,
-      "connected": connected,
+      // Use the same string representation as the native getDevices payload and
+      // the receive-side parsing (`connected == "true"`), rather than a bool.
+      "connected": connected ? "true" : "false",
     };
   }
 }

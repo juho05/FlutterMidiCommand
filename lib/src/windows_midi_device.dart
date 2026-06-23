@@ -168,9 +168,30 @@ class WindowsMidiDevice extends MidiDevice {
     _rxStreamCtrl.add(MidiPacket(data, timestamp, this));
   }
 
+  /// Accumulates SysEx that may be delivered split across several
+  /// MM_MIM_LONGDATA callbacks. The buffer is per-device, so concurrent SysEx
+  /// streams from other devices can no longer corrupt each other.
+  final List<int> _partialSysExBuffer = [];
+
   handleSysexData(Uint8List data, Pointer<MIDIHDR> midiHdrPointer) {
     // print('handle SysEX: $data');
-    _rxStreamCtrl.add(MidiPacket(data, 0, this));
+    // A new SysEx (starting with 0xF0) resets any half-received buffer.
+    if (data.isNotEmpty && data.first == 0xF0) {
+      _partialSysExBuffer.clear();
+    }
+    // Copy out of the native buffer (addAll copies the bytes) before it is
+    // handed back to the driver via _resetHeader below.
+    _partialSysExBuffer.addAll(data);
+
+    if (_partialSysExBuffer.isNotEmpty && _partialSysExBuffer.last == 0xF7) {
+      // Emit the full reassembled message, not just the final chunk.
+      _rxStreamCtrl
+          .add(MidiPacket(Uint8List.fromList(_partialSysExBuffer), 0, this));
+      _partialSysExBuffer.clear();
+    }
+
+    // Return the buffer to the driver so it can keep receiving, including for
+    // intermediate chunks of a multi-part SysEx.
     _resetHeader(midiHdrPointer);
   }
 

@@ -32,7 +32,7 @@ func displayName(endpoint: MIDIEndpointRef) -> String {
 }
 
 func appName() -> String {
-    return Bundle.main.infoDictionary?[kCFBundleNameKey as String] as! String;
+    return Bundle.main.infoDictionary?[kCFBundleNameKey as String] as? String ?? "Flutter MIDI Command";
 }
 
 func stringToId(str: String) -> UInt32 {
@@ -303,9 +303,11 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
                     if let deviceId = deviceInfo["id"] as? String {
                         if connectedDevices[deviceId] != nil {
                             result(FlutterError.init(code: "MESSAGEERROR", message: "Device already connected", details: call.arguments))
-                        } else {
+                        } else if let type = deviceInfo["type"] as? String {
                             ongoingConnections[deviceId] = result
-                            connectToDevice(deviceId: deviceId, type: deviceInfo["type"] as! String, ports: nil)
+                            connectToDevice(deviceId: deviceId, type: type, ports: nil)
+                        } else {
+                            result(FlutterError.init(code: "MESSAGEERROR", message: "No device type", details: deviceInfo))
                         }
                     } else {
                         result(FlutterError.init(code: "MESSAGEERROR", message: "No device Id", details: deviceInfo))
@@ -321,19 +323,19 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
             if let deviceInfo = call.arguments as? Dictionary<String, Any> {
                 if let deviceId = deviceInfo["id"] as? String {
                     disconnectDevice(deviceId: deviceId)
+                    result(nil)
                 } else {
                     result(FlutterError.init(code: "MESSAGEERROR", message: "No device Id", details: call.arguments))
                 }
-                result(nil)
             } else {
                 result(FlutterError.init(code: "MESSAGEERROR", message: "Could not parse device id", details: call.arguments))
             }
-            result(nil)
             break
             
         case "sendData":
-            if let packet = call.arguments as? Dictionary<String, Any> {
-                sendData(packet["data"] as! FlutterStandardTypedData, deviceId: packet["deviceId"] as? String, timestamp: packet["timestamp"] as? UInt64)
+            if let packet = call.arguments as? Dictionary<String, Any>,
+               let data = packet["data"] as? FlutterStandardTypedData {
+                sendData(data, deviceId: packet["deviceId"] as? String, timestamp: packet["timestamp"] as? UInt64)
                 result(nil)
             } else {
                 result(FlutterError.init(code: "MESSAGEERROR", message: "Could not form midi packet", details: call.arguments))
@@ -341,6 +343,7 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
             break
         case "teardown":
             teardown()
+            result(nil)
             break
             
         case "addVirtualDevice":
@@ -366,14 +369,15 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
                 session?.isEnabled = enabled
 #endif
             }
-            
+            result(nil)
+            break;
         case "isNetworkSessionEnabled":
 #if os(iOS)
             result(session?.isEnabled ?? false)
 #else
             result(nil)
 #endif
-            
+            break;
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -1060,7 +1064,15 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         print("central did connect \(peripheral)")
-        (connectedDevices[peripheral.identifier.uuidString] as! ConnectedBLEDevice).setupBLE(stream: setupStreamHandler)
+        // The entry may have been removed while the async connection was in
+        // flight (teardown / disconnect / a fail-then-connect race), so don't
+        // force-unwrap.
+        if let device = connectedDevices[peripheral.identifier.uuidString] as? ConnectedBLEDevice {
+            device.setupBLE(stream: setupStreamHandler)
+        } else {
+            print("connected peripheral \(peripheral.identifier.uuidString) is no longer tracked, cancelling")
+            manager.cancelPeripheralConnection(peripheral)
+        }
     }
     
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -1240,7 +1252,13 @@ class ConnectedVirtualOrNativeDevice : ConnectedDevice {
     }
     
     var buffer = UnsafeMutablePointer<MIDIPacket>.allocate(capacity: 2) // Don't know why I need to a capacity of 2 here. If I setup 1 I'm getting a crash.
-    
+
+    deinit {
+        // MIDIPacket is a trivial value type, so deallocating without an explicit
+        // deinitialize is safe; this releases the per-device packet buffer.
+        buffer.deallocate()
+    }
+
     func handlePacketList(_ packetList:UnsafePointer<MIDIPacketList>, srcConnRefCon:UnsafeMutableRawPointer?) {
         let packets = packetList.pointee
         let packet:MIDIPacket = packets.packet
@@ -1292,13 +1310,19 @@ class ConnectedVirtualOrNativeDevice : ConnectedDevice {
                         midiBuffer.append(midiByte)
                         parserState = PARSER_STATE.PARAMS
                         finalizeMessageIfComplete(timestamp: timestamp)
-                    } else {
+                    } else if (statusByte & 0x80 == 0x80) {
                         // in header state but no status byte, do running status
                         midiBuffer.removeAll()
                         midiBuffer.append(statusByte)
                         midiBuffer.append(midiByte)
                         parserState = PARSER_STATE.PARAMS
                         finalizeMessageIfComplete(timestamp: timestamp)
+                    } else {
+                        // Stray data byte with no running status established
+                        // (e.g. the stream started mid-message); drop it rather
+                        // than emitting a bogus message built on a zero status
+                        // byte, which would also wedge the parser when
+                        // midiPacketLength is 0.
                     }
                     break
                     
@@ -1485,12 +1509,19 @@ class ConnectedNativeDevice : ConnectedVirtualOrNativeDevice {
             for packet in packetList.unsafeSequence() {
                 let offsetStart = getOffsetForPackageData(packetList: packetList, packageNumber: (Int)(packetNumber))
                 let offsetEnd = (offsetStart + (Int)(packet.pointee.length) - 1)
+                // getOffsetForPackageData returns -1 if the packet can't be
+                // located; guard the range so a malformed/empty packet is skipped
+                // rather than crashing on an invalid Range.
+                if offsetStart < 0 || offsetEnd < offsetStart || offsetEnd >= packetListAsRawData.count {
+                    packetNumber += 1
+                    continue
+                }
                 let packetData = packetListAsRawData.subdata(in: Range(offsetStart...offsetEnd))
 
                 let timestamp = UInt64(round(Double(packet.pointee.timeStamp) * timestampFactor))
-                
+
                 parseData(data: packetData, timestamp: timestamp)
-                
+
                 packetNumber += 1
             }
         } else {
@@ -1770,7 +1801,11 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
     
     
     override func close() {
-        CBCentralManager().cancelPeripheralConnection(peripheral)
+        // Only tear down our own state here. The actual connection is cancelled
+        // by the plugin via its shared CBCentralManager (in disconnectDevice /
+        // handleBLEDeviceRemoval); a freshly constructed CBCentralManager does
+        // not own this peripheral's connection and could not cancel it anyway.
+        peripheral.delegate = nil
         characteristic = nil
     }
 
@@ -2092,13 +2127,19 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
                     
                 case BLE_HANDLER_STATE.STATUS_RUNNING:
                     //                print("set running status")
-                    bleMidiPacketLength = lengthOfMessageType(statusByte)
-                    bleMidiBuffer.removeAll()
-                    bleMidiBuffer.append(statusByte)
-                    bleMidiBuffer.append(midiByte)
-                    
-                    if bleMidiPacketLength == 2 {
-                        createMessageEvent(bleMidiBuffer, timestamp: timestamp, peripheral:peripheral)
+                    // Only apply running status when a valid status byte was
+                    // previously established. Without it (e.g. the stream started
+                    // mid-message) the stray data byte would build a bogus message
+                    // on a zero status byte, so drop it instead.
+                    if (statusByte & 0x80 == 0x80) {
+                        bleMidiPacketLength = lengthOfMessageType(statusByte)
+                        bleMidiBuffer.removeAll()
+                        bleMidiBuffer.append(statusByte)
+                        bleMidiBuffer.append(midiByte)
+
+                        if bleMidiPacketLength == 2 {
+                            createMessageEvent(bleMidiBuffer, timestamp: timestamp, peripheral:peripheral)
+                        }
                     }
                     break
                     
@@ -2129,7 +2170,7 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
                 case BLE_HANDLER_STATE.SYSEX_END:
                     //                print("finalize sysex")
                     sysExBuffer.append(midiByte)
-                    createMessageEvent(sysExBuffer, timestamp: 0, peripheral:peripheral)
+                    createMessageEvent(sysExBuffer, timestamp: timestamp, peripheral:peripheral)
                     break
                     
                 default:

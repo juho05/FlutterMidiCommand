@@ -24,8 +24,18 @@ class BLEMidiDevice extends MidiDevice {
 
   StreamController<MidiPacket> _rxStreamCtrl;
 
+  /// Max bytes per BLE write. Defaults to the BLE-MIDI minimum (ATT_MTU 23 - 3
+  /// bytes of ATT overhead) and is raised once the larger MTU is negotiated.
+  int _maxWriteSize = 20;
+
   set connectionState(BleConnectionState state) {
-    UniversalBle.requestMtu(deviceId, 247);
+    UniversalBle.requestMtu(deviceId, 247).then((mtu) {
+      if (mtu > 3) _maxWriteSize = mtu - 3;
+    }).catchError((e) {
+      // Some platforms/peripherals don't support MTU negotiation; the 20-byte
+      // default keeps working.
+      print('requestMtu failed: $e');
+    });
 
     if (devState.index < DeviceState.Interrogating.index) {
       _discoverServices();
@@ -57,7 +67,7 @@ class BLEMidiDevice extends MidiDevice {
     if (_midiService == null) return;
     if (_midiCharacteristic == null) return;
 
-    var packetSize = 20;
+    var packetSize = _maxWriteSize;
 
     List<int> dataBytes = List.from(bytes);
 
@@ -312,13 +322,19 @@ class BLEMidiDevice extends MidiDevice {
             break;
 
           case BLE_HANDLER_STATE.STATUS_RUNNING:
-            bleMidiPacketLength = _lengthOfMessageType(statusByte);
-            bleMidiBuffer.clear();
-            bleMidiBuffer.add(statusByte);
-            bleMidiBuffer.add(midiByte);
+            // Only apply running status when a valid status byte was previously
+            // established. Without it (e.g. the stream started mid-message) the
+            // stray data byte would build a bogus message on a zero status byte,
+            // so drop it instead.
+            if ((statusByte & 0x80) == 0x80) {
+              bleMidiPacketLength = _lengthOfMessageType(statusByte);
+              bleMidiBuffer.clear();
+              bleMidiBuffer.add(statusByte);
+              bleMidiBuffer.add(midiByte);
 
-            if (bleMidiPacketLength == 2) {
-              _createMessageEvent(bleMidiBuffer, timestamp);
+              if (bleMidiPacketLength == 2) {
+                _createMessageEvent(bleMidiBuffer, timestamp);
+              }
             }
             break;
 
@@ -344,7 +360,7 @@ class BLEMidiDevice extends MidiDevice {
 
           case BLE_HANDLER_STATE.SYSEX_END:
             sysExBuffer.add(midiByte);
-            _createMessageEvent(sysExBuffer, 0);
+            _createMessageEvent(sysExBuffer, timestamp);
             break;
 
           default:

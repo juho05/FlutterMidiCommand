@@ -299,8 +299,11 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
 
   @override
   void teardown() {
-    // Close callback isolate
-    _midiCB.close();
+    // Note: the shared native MIDI-in callback (_midiCB) is intentionally NOT
+    // closed here. It is a process-lifetime callback whose address is baked into
+    // every WindowsMidiDevice, so closing it would invalidate reconnection. This
+    // (singleton) instance must stay reusable after teardown, which only
+    // disconnects devices per the documented contract.
 
     // Disconnect native devices. Pass remove: false so disconnectDevice does not
     // mutate _connectedDevices while we iterate it; the map is cleared afterwards
@@ -321,7 +324,9 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
     });
 
     _setupStreamController.add("deviceDisconnected");
-    _rxStreamController.close();
+    // Do not close _rxStreamController here: teardown only disconnects devices.
+    // Closing the broadcast controller would leave this (singleton) instance
+    // unusable for any later connect/sendData.
   }
 
   /// Sends data to the currently connected devices or a specific midi device
@@ -504,8 +509,6 @@ const int MHDR_DONE = 0x00000001;
 const int MHDR_PREPARED = 0x00000002;
 const int MHDR_INQUEUE = 0x00000004;
 
-final List<int> partialSysExBuffer = [];
-
 void _onMidiData(
     int hMidiIn, int wMsg, int dwInstance, int dwParam1, int dwParam2) {
   var dev = FlutterMidiCommandWindows().findMidiDeviceForSource(hMidiIn);
@@ -529,22 +532,9 @@ void _onMidiData(
         final dataPointer = midiHdr.lpData.cast<Uint8>();
         final messageData = dataPointer.asTypedList(midiHdr.dwBytesRecorded);
 
-        if (messageData.isNotEmpty && messageData.first == 0xF0) {
-          partialSysExBuffer.clear();
-        }
-
-        partialSysExBuffer.addAll(messageData);
-
-        if (partialSysExBuffer.isNotEmpty && partialSysExBuffer.last == 0xF7) {
-          dev?.handleSysexData(messageData, midiHdrPointer);
-          partialSysExBuffer.clear();
-        }
-
-        //var pMidiHdr = Pointer.fromAddress(dwParam1).cast<MIDIHDR>();
-
-        //var data = pMidiHdr.ref.lpData
-        //    .cast<Uint8>()
-        //    .asTypedList(pMidiHdr.ref.dwBytesRecorded);
+        // Reassembly is handled per-device so concurrent SysEx from different
+        // devices can't corrupt a shared buffer.
+        dev?.handleSysexData(messageData, midiHdrPointer);
       } else {
         // Decode and log each flag for debugging
         if ((midiHdr.dwFlags & MHDR_PREPARED) != 0) {

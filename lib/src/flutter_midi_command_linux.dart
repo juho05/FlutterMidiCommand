@@ -297,7 +297,10 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
     });
 
     _setupStreamController.add("deviceDisconnected");
-    _rxStreamController.close();
+    // Do not close _rxStreamController here: teardown only disconnects devices
+    // (matching the documented contract and the darwin/Android backends).
+    // Closing the broadcast controller would leave the plugin instance unusable
+    // for any later connect/sendData on the same instance.
   }
 
   /// Sends data to the currently connected device.wmidi hardware driver name
