@@ -1,6 +1,7 @@
 
 import 'dart:async';
-import 'dart:io';
+import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter_midi_command/flutter_midi_command.dart';
 import 'package:csv/csv.dart';
@@ -43,17 +44,18 @@ class MidiRecorder {
 
     var csv = const ListToCsvConverter().convert(rows);
 
-    String? outputFile = await FilePicker.platform.saveFile(
+    // file_picker 12.x writes the provided bytes to the chosen path itself, so
+    // we pass the CSV content as bytes and no longer write the file manually.
+    String? outputFile = await FilePicker.saveFile(
       dialogTitle: 'Please select an output file:',
       fileName: 'midi_recording.csv',
       type: FileType.custom,
       allowedExtensions: ['csv'],
+      bytes: Uint8List.fromList(utf8.encode(csv)),
     );
 
     if (outputFile == null) {
       // User canceled the picker
-    } else {
-      await File(outputFile).writeAsString(csv);
     }
 
     print("recording exported");

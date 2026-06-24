@@ -1,13 +1,13 @@
 import 'dart:async';
-import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
-
 import 'dart:ffi';
-import 'package:ffi/ffi.dart';
-import 'package:universal_ble/universal_ble.dart';
-import 'package:win32/win32.dart';
+import 'dart:typed_data';
+
 import 'package:device_manager/device_event.dart';
 import 'package:device_manager/device_manager.dart';
+import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart';
+import 'package:universal_ble/universal_ble.dart';
+import 'package:win32/win32.dart';
 
 import 'ble_midi_device.dart';
 import 'midi_command_platform_interface.dart';
@@ -107,10 +107,16 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
 
       bool isConnected = _connectedDevices.containsKey(id);
       //print('found IN at i $i id $id for device $name');
-      devices[id] = WindowsMidiDevice(id, name, _rxStreamController,
-          _setupStreamController, _midiCB.nativeFunction.address)
-        ..addInput(i, inCaps.ref)
-        ..connected = isConnected;
+      devices[id] =
+          WindowsMidiDevice(
+              id,
+              name,
+              _rxStreamController,
+              _setupStreamController,
+              _midiCB.nativeFunction.address,
+            )
+            ..addInput(i, inCaps.ref)
+            ..connected = isConnected;
     }
 
     free(inCaps);
@@ -144,10 +150,16 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
         // print('found OUT at i $i id $id for device $name');
 
         bool isConnected = _connectedDevices.containsKey(id);
-        devices[id] = WindowsMidiDevice(id, name, _rxStreamController,
-            _setupStreamController, _midiCB.nativeFunction.address)
-          ..addOutput(i, outCaps.ref)
-          ..connected = isConnected;
+        devices[id] =
+            WindowsMidiDevice(
+                id,
+                name,
+                _rxStreamController,
+                _setupStreamController,
+                _midiCB.nativeFunction.address,
+              )
+              ..addOutput(i, outCaps.ref)
+              ..connected = isConnected;
       }
     }
 
@@ -172,9 +184,13 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       if (!_discoveredBLEDevices.containsKey(result.deviceId)) {
         if (result.name != null) {
           debugPrint(
-              "${result.name} ${result.deviceId} ${result.manufacturerDataList.map((e) => e.toString()).join(', ')}");
-          _discoveredBLEDevices[result.deviceId] =
-              BLEMidiDevice(result.deviceId, result.name!, _rxStreamController);
+            "${result.name} ${result.deviceId} ${result.manufacturerDataList.map((e) => e.toString()).join(', ')}",
+          );
+          _discoveredBLEDevices[result.deviceId] = BLEMidiDevice(
+            result.deviceId,
+            result.name!,
+            _rxStreamController,
+          );
           _setupStreamController.add('deviceAppeared');
         }
       }
@@ -201,11 +217,12 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       }
     };
 
-    UniversalBle.onValueChange = (deviceId, characteristicId, Uint8List data, int? timestamp) {
-      if (_discoveredBLEDevices.containsKey(deviceId)) {
-        _discoveredBLEDevices[deviceId]!.handleData(data);
-      }
-    };
+    UniversalBle.onValueChange =
+        (deviceId, characteristicId, Uint8List data, int? timestamp) {
+          if (_discoveredBLEDevices.containsKey(deviceId)) {
+            _discoveredBLEDevices[deviceId]!.handleData(data);
+          }
+        };
 
     UniversalBle.onPairingStateChange = (deviceId, isPaired) {
       if (_discoveredBLEDevices.containsKey(deviceId)) {
@@ -232,7 +249,8 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   Future<void> startScanningForBluetoothDevices() async {
     try {
       await UniversalBle.startScan(
-          scanFilter: ScanFilter(withServices: [MIDI_SERVICE_ID]));
+        scanFilter: ScanFilter(withServices: [MIDI_SERVICE_ID]),
+      );
     } catch (e) {
       print(e.toString());
     }
@@ -256,8 +274,10 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
 
   /// Connects to the device.
   @override
-  Future<void> connectToDevice(MidiDevice device,
-      {List<MidiPort>? ports}) async {
+  Future<void> connectToDevice(
+    MidiDevice device, {
+    List<MidiPort>? ports,
+  }) async {
     if (device is WindowsMidiDevice) {
       var success = device.connect();
       if (success) {
@@ -317,9 +337,9 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
 
     // Disconnect any connected BLE devices as well. Their disconnect event is
     // emitted from the onConnectionChange callback.
-    _discoveredBLEDevices.values
-        .where((device) => device.connected)
-        .forEach((device) {
+    _discoveredBLEDevices.values.where((device) => device.connected).forEach((
+      device,
+    ) {
       disconnectDevice(device, remove: false);
     });
 
@@ -341,8 +361,8 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       _discoveredBLEDevices.values
           .where((element) => element.deviceId == deviceId)
           .forEach((element) {
-        element.send(data);
-      });
+            element.send(data);
+          });
     } else {
       // Send to all devices
       _connectedDevices.values.forEach((device) {
@@ -352,8 +372,8 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       _discoveredBLEDevices.values
           .where((element) => element.connected)
           .forEach((element) {
-        element.send(data);
-      });
+            element.send(data);
+          });
     }
   }
 
@@ -399,7 +419,7 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
 
   @override
   Future<bool?> get isNetworkSessionEnabled async {
-    return false;
+    return null;
   }
 
   @override
@@ -480,6 +500,7 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       }
     }
   }
+
   //#endregion
 }
 
@@ -502,15 +523,25 @@ String midiErrorMessage(int status) {
   }
 }
 
-NativeCallable<Void Function(IntPtr, Uint32, IntPtr, IntPtr, IntPtr)> _midiCB =
-    NativeCallable<MIDIINPROC>.listener(_onMidiData);
+// win32 6.x's MIDIINPROC typedef uses the HMIDIIN extension type, which is not
+// a valid dart:ffi native function type for NativeCallable. Spell out the raw
+// native signature (matching MIDIINPROC's ABI) instead.
+final _midiCB =
+    NativeCallable<
+      Void Function(IntPtr, Uint32, IntPtr, IntPtr, IntPtr)
+    >.listener(_onMidiData);
 
 const int MHDR_DONE = 0x00000001;
 const int MHDR_PREPARED = 0x00000002;
 const int MHDR_INQUEUE = 0x00000004;
 
 void _onMidiData(
-    int hMidiIn, int wMsg, int dwInstance, int dwParam1, int dwParam2) {
+  int hMidiIn,
+  int wMsg,
+  int dwInstance,
+  int dwParam1,
+  int dwParam2,
+) {
   var dev = FlutterMidiCommandWindows().findMidiDeviceForSource(hMidiIn);
   final midiHdrPointer = Pointer<MIDIHDR>.fromAddress(dwParam1);
   final midiHdr = midiHdrPointer.ref;

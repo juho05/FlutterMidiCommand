@@ -14,7 +14,7 @@ dependencies:
   plugin_platform_interface: ^2.0.0
   # Linux (ALSA) and Windows (win32) implementations
   ffi: ^2.1.4
-  win32: ^5.14.0
+  win32: ^6.0.0
   universal_ble: ^2.0.4
   device_manager: ^0.0.7
 

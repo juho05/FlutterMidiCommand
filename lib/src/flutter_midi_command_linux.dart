@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:universal_ble/universal_ble.dart';
@@ -15,14 +14,20 @@ class LinuxMidiDevice extends MidiDevice {
   AlsaMidiDevice _device;
   StreamSubscription? _rxSubscription;
 
-  LinuxMidiDevice(this._device, this.cardId, this.deviceId, String name, String type,
-      this._rxStreamCtrl, bool connected)
-      : super(
-          AlsaMidiDevice.hardwareId(cardId, deviceId),
-          name,
-          type,
-          connected,
-        ) {
+  LinuxMidiDevice(
+    this._device,
+    this.cardId,
+    this.deviceId,
+    String name,
+    String type,
+    this._rxStreamCtrl,
+    bool connected,
+  ) : super(
+        AlsaMidiDevice.hardwareId(cardId, deviceId),
+        name,
+        type,
+        connected,
+      ) {
     // Get input, output ports
     var i = 0;
     _device.inputPorts.toList().forEach((element) {
@@ -62,17 +67,22 @@ class LinuxMidiDevice extends MidiDevice {
 }
 
 class FlutterMidiCommandLinux extends MidiCommandPlatform {
-  StreamController<MidiPacket> _rxStreamController = StreamController<MidiPacket>.broadcast();
+  StreamController<MidiPacket> _rxStreamController =
+      StreamController<MidiPacket>.broadcast();
   late Stream<MidiPacket> _rxStream;
-  StreamController<String> _setupStreamController = StreamController<String>.broadcast();
+  StreamController<String> _setupStreamController =
+      StreamController<String>.broadcast();
   late Stream<String> _setupStream;
-  StreamController<MidiDevice> _deviceDisconnectedController = StreamController<MidiDevice>.broadcast();
+  StreamController<MidiDevice> _deviceDisconnectedController =
+      StreamController<MidiDevice>.broadcast();
   late Stream<MidiDevice> _deviceDisconnectedStream;
 
-  StreamController<String> _bluetoothStateStreamController = StreamController<String>.broadcast();
+  StreamController<String> _bluetoothStateStreamController =
+      StreamController<String>.broadcast();
   late Stream<String> _bluetoothStateStream;
 
-  Map<String, LinuxMidiDevice> _connectedDevices = Map<String, LinuxMidiDevice>();
+  Map<String, LinuxMidiDevice> _connectedDevices =
+      Map<String, LinuxMidiDevice>();
 
   String _bleState = "unknown";
   Map<String, BLEMidiDevice> _discoveredBLEDevices = {};
@@ -89,7 +99,10 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
     // from [_connectedDevices] (and the event emitted) in disconnectDevice, so
     // this only fires for unexpected drops.
     AlsaMidiDevice.onDeviceDisconnected.listen((alsaDevice) {
-      var id = AlsaMidiDevice.hardwareId(alsaDevice.cardId, alsaDevice.deviceId);
+      var id = AlsaMidiDevice.hardwareId(
+        alsaDevice.cardId,
+        alsaDevice.deviceId,
+      );
       var device = _connectedDevices.remove(id);
       if (device != null) {
         // The underlying ALSA device is already torn down; this just cancels our
@@ -124,7 +137,11 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
             "native",
             _rxStreamController,
             _connectedDevices.containsKey(
-                AlsaMidiDevice.hardwareId(alsMidiDevice.cardId, alsMidiDevice.deviceId)),
+              AlsaMidiDevice.hardwareId(
+                alsMidiDevice.cardId,
+                alsMidiDevice.deviceId,
+              ),
+            ),
           ),
         )
         .toList();
@@ -135,7 +152,6 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
 
     return devices;
   }
-
 
   /// Prepares Bluetooth system
   ///
@@ -154,9 +170,13 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       if (!_discoveredBLEDevices.containsKey(result.deviceId)) {
         if (result.name != null) {
           debugPrint(
-              "${result.name} ${result.deviceId} ${result.manufacturerDataList.map((e) => e.toString()).join(', ')}");
-          _discoveredBLEDevices[result.deviceId] =
-              BLEMidiDevice(result.deviceId, result.name!, _rxStreamController);
+            "${result.name} ${result.deviceId} ${result.manufacturerDataList.map((e) => e.toString()).join(', ')}",
+          );
+          _discoveredBLEDevices[result.deviceId] = BLEMidiDevice(
+            result.deviceId,
+            result.name!,
+            _rxStreamController,
+          );
           _setupStreamController.add('deviceAppeared');
         }
       }
@@ -183,11 +203,12 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       }
     };
 
-    UniversalBle.onValueChange = (deviceId, characteristicId, Uint8List data, int? timestamp) {
-      if (_discoveredBLEDevices.containsKey(deviceId)) {
-        _discoveredBLEDevices[deviceId]!.handleData(data);
-      }
-    };
+    UniversalBle.onValueChange =
+        (deviceId, characteristicId, Uint8List data, int? timestamp) {
+          if (_discoveredBLEDevices.containsKey(deviceId)) {
+            _discoveredBLEDevices[deviceId]!.handleData(data);
+          }
+        };
 
     UniversalBle.onPairingStateChange = (deviceId, isPaired) {
       if (_discoveredBLEDevices.containsKey(deviceId)) {
@@ -215,7 +236,8 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   Future<void> startScanningForBluetoothDevices() async {
     try {
       await UniversalBle.startScan(
-          scanFilter: ScanFilter(withServices: [MIDI_SERVICE_ID]));
+        scanFilter: ScanFilter(withServices: [MIDI_SERVICE_ID]),
+      );
     } catch (e) {
       print(e.toString());
     }
@@ -237,7 +259,10 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
 
   /// Connects to the device.
   @override
-  Future<void> connectToDevice(MidiDevice device, {List<MidiPort>? ports}) async {
+  Future<void> connectToDevice(
+    MidiDevice device, {
+    List<MidiPort>? ports,
+  }) async {
     print('connect to $device');
 
     if (device is BLEMidiDevice) {
@@ -290,9 +315,9 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
 
     // Disconnect any connected BLE devices as well. Their disconnect event is
     // emitted from the onConnectionChange callback.
-    _discoveredBLEDevices.values
-        .where((device) => device.connected)
-        .forEach((device) {
+    _discoveredBLEDevices.values.where((device) => device.connected).forEach((
+      device,
+    ) {
       disconnectDevice(device, remove: false);
     });
 
@@ -315,8 +340,8 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       _discoveredBLEDevices.values
           .where((device) => device.deviceId == deviceId)
           .forEach((device) {
-        device.send(data);
-      });
+            device.send(data);
+          });
     } else {
       // Send to all connected devices.
       _connectedDevices.values.forEach((device) {
@@ -324,9 +349,9 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
         device.send(data, data.length);
       });
 
-      _discoveredBLEDevices.values
-          .where((device) => device.connected)
-          .forEach((device) {
+      _discoveredBLEDevices.values.where((device) => device.connected).forEach((
+        device,
+      ) {
         device.send(data);
       });
     }
@@ -368,4 +393,7 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   void removeVirtualDevice({String? name}) {
     // Not implemented
   }
+
+  @override
+  Future<bool?> get isNetworkSessionEnabled async => null;
 }
