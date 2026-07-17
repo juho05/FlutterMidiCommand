@@ -518,7 +518,28 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         connectedDevices.removeValue(forKey: device.id)
         sendDisconnect(info: info)
         updateSetupState(data: "deviceDisconnected")
-        resumeScanIfNeeded()
+        refreshDiscoveredAfterBLEDisconnect(device.peripheral)
+    }
+
+    /// Called after a BLE peripheral is removed. Drops it from the discovered
+    /// set and restarts the scan so we can tell "still present" from "gone".
+    ///
+    /// CoreBluetooth de-duplicates advertisements within a scan session (we scan
+    /// with `options: nil`), so a peripheral that has already advertised will not
+    /// deliver another `didDiscover` until the scan is restarted. If we merely
+    /// removed it, a device that is actually still reachable would disappear and
+    /// never come back. Restarting the scan resets de-dup: a peripheral that is
+    /// still around re-advertises within ~1-2s and is re-added (firing
+    /// `deviceAppeared`, which drives reconnect), while a powered-off device
+    /// never re-advertises and stays absent, surfacing as a remembered device.
+    /// Only the just-removed peripheral is dropped, so other discovered devices
+    /// are left untouched. No rescan when no scan is active; the peripheral is
+    /// still dropped so getDevices stops reporting it as a stale entry.
+    func refreshDiscoveredAfterBLEDisconnect(_ peripheral: CBPeripheral) {
+        discoveredDevices.remove(peripheral)
+        guard scanRequested, manager != nil, manager.state == .poweredOn else { return }
+        manager.stopScan()
+        manager.scanForPeripherals(withServices: [midiServiceCBUUID], options: nil)
     }
 
     /// Completes a successful BLE connect: fires the pending result once, clears
