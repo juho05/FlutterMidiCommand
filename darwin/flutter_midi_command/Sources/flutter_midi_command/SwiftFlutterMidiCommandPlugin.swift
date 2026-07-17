@@ -67,11 +67,31 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     // BLE
     var manager:CBCentralManager!
     var discoveredDevices:Set<CBPeripheral> = []
-    
-    
+
+
     var ongoingConnections = Dictionary<String, FlutterResult>()
-    
-    
+
+    // BLE MIDI service UUID.
+    let midiServiceCBUUID = CBUUID(string: "03B80E5A-EDE8-4B33-A751-6CE34EC4C700")
+
+    // True while the Dart side believes a scan it started is active. Used to
+    // resume scanning after a connect attempt (which stops the scan) resolves.
+    var scanRequested = false
+
+    // Low-frequency reconcile while scanning, plus debounce for burst triggers.
+    var reconcileTimer: Timer?
+    var lastReconcile: Date?
+
+    // Owns the ".connecting" state: reap a connect that never completes.
+    let connectTimeout: TimeInterval = 15.0
+    // Half-open window: connected link but MIDI characteristic never discovered.
+    let characteristicGrace: TimeInterval = 10.0
+    // Insert-to-".connecting" window before a disconnected peripheral is reaped.
+    let connectGrace: TimeInterval = 1.0
+    let reconcileTimerInterval: TimeInterval = 5.0
+    let reconcileDebounceInterval: TimeInterval = 1.0
+
+
     let midiLog = OSLog(subsystem: "com.invisiblewrench.FlutterMidiCommand", category: "MIDI")
     
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -88,6 +108,7 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     
     deinit {
         NotificationCenter.default.removeObserver(self)
+        stopReconcileTimer()
         MIDIClientDispose(midiClient)
     }
     
@@ -269,9 +290,19 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
             if manager.state == CBManagerState.poweredOn {
                 print("Start discovery")
                 manager.stopScan()
-                let serviceList = [CBUUID(string: "03B80E5A-EDE8-4B33-A751-6CE34EC4C700")]
-                manager.retrieveConnectedPeripherals(withServices: serviceList)
-                manager.scanForPeripherals(withServices: serviceList, options: nil)
+                // Surface peripherals already connected at the system level (e.g.
+                // paired via another app, or held by the system after our app
+                // restarted); manager.connect on these completes immediately.
+                let alreadyConnected = manager.retrieveConnectedPeripherals(withServices: [midiServiceCBUUID])
+                for periph in alreadyConnected {
+                    if !discoveredDevices.contains(periph) {
+                        discoveredDevices.insert(periph)
+                        updateSetupState(data: "deviceAppeared")
+                    }
+                }
+                scanRequested = true
+                startReconcileTimer()
+                manager.scanForPeripherals(withServices: [midiServiceCBUUID], options: nil)
                 result(nil)
             } else {
                 print("BT not ready")
@@ -280,6 +311,8 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
             break
         case "stopScanForDevices":
             startBluetoothCentralWhenNeeded();
+            scanRequested = false
+            stopReconcileTimer()
             manager.stopScan()
             // Prune discovered-but-not-connected peripherals so a later
             // getDevices() call no longer lists BLE devices that went out of
@@ -293,6 +326,11 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
             discoveredDevices = discoveredDevices.filter { connectedDevices.keys.contains($0.identifier.uuidString) }
             break
         case "getDevices":
+            // Reconcile BLE synchronously here (the handler already runs on main)
+            // so a stale connected/discovered pair is cleaned for this same call.
+            // Native devices are enumerated live below and cannot go stale here,
+            // so they keep their event-driven/async removal path.
+            handleBLEDeviceRemovalSync()
             let devices = getDevices()
             print("--- devices ---\n\(devices)")
             result(devices)
@@ -384,9 +422,12 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     }
     
     func teardown() {
-        for device in connectedDevices {
-            disconnectDevice(deviceId: device.value.id)
+        // Snapshot: disconnectDevice mutates connectedDevices while we iterate.
+        for device in Array(connectedDevices.values) {
+            disconnectDevice(deviceId: device.id)
         }
+        scanRequested = false
+        stopReconcileTimer()
     }
     
     
@@ -399,8 +440,13 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
                 connectedDevices[deviceId] = device
                 manager.stopScan()
                 manager.connect(periph, options: nil)
+                startConnectTimeout(for: device)
             } else {
                 print("error connecting to device \(deviceId) [\(type)]")
+                if let result = ongoingConnections[deviceId] {
+                    result(FlutterError(code: "MESSAGEERROR", message: "Device not found", details: deviceId))
+                }
+                ongoingConnections.removeValue(forKey: deviceId)
             }
         } else if type == "own-virtual" {
             let device = ownVirtualDevices.first { device in
@@ -432,11 +478,12 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         let device = connectedDevices[deviceId]
         print("disconnect \(String(describing: device)) for id \(deviceId)")
         if let device = device {
+            if device.deviceType == "BLE", let ble = device as? ConnectedBLEDevice {
+                removeBLEDevice(ble, error: FlutterError(code: "BLEERROR", message: "Disconnected by request", details: deviceId))
+                return
+            }
             let info = device.disconnectInfo()
-            if device.deviceType == "BLE" {
-                let p = (device as! ConnectedBLEDevice).peripheral
-                manager.cancelPeripheralConnection(p)
-            } else if device.deviceType == "own-virtual" {
+            if device.deviceType == "own-virtual" {
                 print("disconnected MIDI")
                 (device as! ConnectedOwnVirtualDevice).isConnected = false
                 updateSetupState(data: "deviceDisconnected")
@@ -449,6 +496,89 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
             connectedDevices.removeValue(forKey: deviceId)
             sendDisconnect(info: info)
         }
+    }
+
+    /// Single removal path for BLE devices (pending-result discipline). Fails any
+    /// pending connect result exactly once, cancels the connection, tears down the
+    /// device object, removes the entry and emits disconnect events.
+    func removeBLEDevice(_ device: ConnectedBLEDevice, error: FlutterError?) {
+        let info = device.disconnectInfo()
+        device.cancelConnectTimeout()
+        if let result = device.connectResult {
+            result(error ?? FlutterError(code: "BLEERROR", message: "Device disconnected", details: device.id))
+            device.connectResult = nil
+        }
+        ongoingConnections.removeValue(forKey: device.id)
+        // Skip when not powered on: CoreBluetooth has already invalidated every
+        // peripheral, and cancelling then only logs an API-misuse warning.
+        if manager != nil, manager.state == .poweredOn {
+            manager.cancelPeripheralConnection(device.peripheral)
+        }
+        device.close()
+        connectedDevices.removeValue(forKey: device.id)
+        sendDisconnect(info: info)
+        updateSetupState(data: "deviceDisconnected")
+        resumeScanIfNeeded()
+    }
+
+    /// Completes a successful BLE connect: fires the pending result once, clears
+    /// bookkeeping, and resumes the scan if one is still requested.
+    func completeBLEConnectSuccess(_ device: ConnectedBLEDevice) {
+        device.cancelConnectTimeout()
+        if let result = device.connectResult {
+            result(nil)
+            device.connectResult = nil
+        }
+        ongoingConnections.removeValue(forKey: device.id)
+        resumeScanIfNeeded()
+    }
+
+    /// Reap a connect attempt that never reaches didConnect / didFailToConnect.
+    func startConnectTimeout(for device: ConnectedBLEDevice) {
+        device.connectTimeoutTimer?.invalidate()
+        // .common mode so the timeout still fires while the UI is tracking (e.g.
+        // the user is scrolling a device list during the connect attempt).
+        let timer = Timer(timeInterval: connectTimeout, repeats: false) { [weak self, weak device] _ in
+            guard let self = self, let device = device else { return }
+            print("connect timeout for \(device.id)")
+            self.removeBLEDevice(device, error: FlutterError(code: "BLEERROR", message: "Connection timed out", details: device.id))
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        device.connectTimeoutTimer = timer
+    }
+
+    /// Restart scanning after a connect attempt (which stops the scan) resolves,
+    /// as long as the Dart side still considers a scan active.
+    func resumeScanIfNeeded() {
+        if scanRequested, manager != nil, manager.state == .poweredOn {
+            manager.scanForPeripherals(withServices: [midiServiceCBUUID], options: nil)
+        }
+    }
+
+    func startReconcileTimer() {
+        reconcileTimer?.invalidate()
+        let timer = Timer(timeInterval: reconcileTimerInterval, repeats: true) { [weak self] _ in
+            self?.triggerReconcile()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        reconcileTimer = timer
+    }
+
+    func stopReconcileTimer() {
+        reconcileTimer?.invalidate()
+        reconcileTimer = nil
+    }
+
+    /// Debounced BLE reconcile trigger for the scan-driven entry points (the
+    /// repeating timer and didDiscover). Coalesces bursts to at most once per
+    /// window. Native removal stays on its notification-driven path.
+    func triggerReconcile() {
+        let now = Date()
+        if let last = lastReconcile, now.timeIntervalSince(last) < reconcileDebounceInterval {
+            return
+        }
+        lastReconcile = now
+        handleBLEDeviceRemoval()
     }
     
     
@@ -542,18 +672,22 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         // endpoints, avoiding a false positive from a transient enumeration in
         // the middle of a setup change.
         DispatchQueue.main.async {
-            let presentIds = self.currentNativeDeviceIds()
-            let removed = self.connectedDevices.filter { (_, device) in
-                (device.deviceType == "native" || device.deviceType == "network")
-                    && !presentIds.contains(device.id)
-            }
-            for (key, device) in removed {
-                print("native device removed \(device.id)")
-                let info = device.disconnectInfo()
-                device.close()
-                self.connectedDevices.removeValue(forKey: key)
-                self.sendDisconnect(info: info)
-            }
+            self.handleNativeDeviceRemovalSync()
+        }
+    }
+
+    func handleNativeDeviceRemovalSync() {
+        let presentIds = currentNativeDeviceIds()
+        let removed = connectedDevices.filter { (_, device) in
+            (device.deviceType == "native" || device.deviceType == "network")
+                && !presentIds.contains(device.id)
+        }
+        for (key, device) in removed {
+            print("native device removed \(device.id)")
+            let info = device.disconnectInfo()
+            device.close()
+            connectedDevices.removeValue(forKey: key)
+            sendDisconnect(info: info)
         }
     }
 
@@ -563,21 +697,31 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     /// disconnect event for each.
     func handleBLEDeviceRemoval() {
         DispatchQueue.main.async {
-            let removed = self.connectedDevices.filter { (_, device) in
-                guard device.deviceType == "BLE",
-                      let ble = device as? ConnectedBLEDevice else { return false }
-                return ble.peripheral.state == .disconnected
+            self.handleBLEDeviceRemovalSync()
+        }
+    }
+
+    /// Removes connected BLE devices that are dead weight: peripherals that
+    /// disconnected/are disconnecting (past the insert-to-connecting grace), and
+    /// "half-open" peripherals still linked but with no MIDI characteristic past
+    /// the characteristic grace. ".connecting" is deliberately excluded; that
+    /// state is owned by the per-connect timeout (Change 4).
+    func handleBLEDeviceRemovalSync() {
+        let now = Date()
+        let removed = connectedDevices.values.compactMap { $0 as? ConnectedBLEDevice }.filter { ble in
+            let elapsed = now.timeIntervalSince(ble.connectRequestTime)
+            switch ble.peripheral.state {
+            case .disconnected, .disconnecting:
+                return elapsed > connectGrace
+            case .connected:
+                return ble.characteristic == nil && elapsed > characteristicGrace
+            default:
+                return false
             }
-            for (key, device) in removed {
-                print("ble device removed \(device.id)")
-                let info = device.disconnectInfo()
-                if let ble = device as? ConnectedBLEDevice {
-                    self.manager.cancelPeripheralConnection(ble.peripheral)
-                }
-                device.close()
-                self.connectedDevices.removeValue(forKey: key)
-                self.sendDisconnect(info: info)
-            }
+        }
+        for device in removed {
+            print("ble device removed \(device.id)")
+            removeBLEDevice(device, error: FlutterError(code: "BLEERROR", message: "Device disconnected", details: device.id))
         }
     }
 
@@ -1052,49 +1196,76 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
         print("central did update state \(getBluetoothCentralStateAsString())")
         updateBluetoothState(data: getBluetoothCentralStateAsString());
+
+        // Anything other than poweredOn (except the pre-init unknown state)
+        // invalidates every peripheral. Reap all BLE state event-driven instead
+        // of waiting for a reconcile, so stale connected entries stop suppressing
+        // app-side auto-reconnect once Bluetooth returns.
+        if central.state != .poweredOn && central.state != .unknown {
+            let bleDevices = connectedDevices.values.compactMap { $0 as? ConnectedBLEDevice }
+            for device in bleDevices {
+                removeBLEDevice(device, error: FlutterError(code: "BLEERROR", message: "Bluetooth unavailable", details: device.id))
+            }
+            if !discoveredDevices.isEmpty {
+                discoveredDevices.removeAll()
+                updateSetupState(data: "deviceDisappeared")
+            }
+        }
     }
-    
+
     public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
         print("central didDiscover \(peripheral)")
         if !discoveredDevices.contains(peripheral) {
             discoveredDevices.insert(peripheral)
             updateSetupState(data: "deviceAppeared")
         }
+        // A fresh advertisement is the moment a stale connected/discovered pair
+        // materializes, so reconcile (debounced against discovery bursts).
+        triggerReconcile()
     }
-    
+
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         print("central did connect \(peripheral)")
         // The entry may have been removed while the async connection was in
         // flight (teardown / disconnect / a fail-then-connect race), so don't
         // force-unwrap.
         if let device = connectedDevices[peripheral.identifier.uuidString] as? ConnectedBLEDevice {
-            device.setupBLE(stream: setupStreamHandler)
+            // The link is up; the per-connect timeout has done its job. From here
+            // the characteristic grace (Change 2) is the backstop.
+            device.cancelConnectTimeout()
+            device.setupBLE(stream: setupStreamHandler, onSuccess: { [weak self] dev in
+                self?.completeBLEConnectSuccess(dev)
+            }, onFailure: { [weak self] dev, err in
+                self?.removeBLEDevice(dev, error: err)
+            })
         } else {
             print("connected peripheral \(peripheral.identifier.uuidString) is no longer tracked, cancelling")
             manager.cancelPeripheralConnection(peripheral)
         }
     }
-    
+
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         print("central did fail to connect state \(peripheral) \(String(describing: error?.localizedDescription))")
-        
+
         updateSetupState(data: "connectionFailed")
-        connectedDevices.removeValue(forKey: peripheral.identifier.uuidString)
+        let uuid = peripheral.identifier.uuidString
+        if let device = connectedDevices[uuid] as? ConnectedBLEDevice {
+            removeBLEDevice(device, error: FlutterError(code: "BLEERROR", message: error?.localizedDescription ?? "Failed to connect", details: uuid))
+        } else {
+            connectedDevices.removeValue(forKey: uuid)
+        }
     }
-    
+
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         print("central didDisconnectPeripheral \(peripheral)")
-
-        updateSetupState(data: "deviceDisconnected")
 
         // Runs on main (the manager's delivery queue), serialized with
         // disconnectDevice / handleNativeDeviceRemoval / handleBLEDeviceRemoval.
         // The check-remove-emit is therefore atomic: only whichever path runs
         // first emits, any later one finds the entry already gone and is ignored.
         let uuid = peripheral.identifier.uuidString
-        if let device = connectedDevices[uuid] {
-            connectedDevices.removeValue(forKey: uuid)
-            sendDisconnect(info: device.disconnectInfo())
+        if let device = connectedDevices[uuid] as? ConnectedBLEDevice {
+            removeBLEDevice(device, error: FlutterError(code: "BLEERROR", message: "Device disconnected", details: uuid))
         }
     }
 }
@@ -1786,25 +1957,41 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
     
     var setupStream : StreamHandler?
     var connectResult : FlutterResult?
-    
+
+    // When the connect was requested; drives the reconcile grace windows.
+    let connectRequestTime = Date()
+    // Per-connect timeout owned by the plugin (Change 4).
+    var connectTimeoutTimer : Timer?
+    // Plugin callbacks so the device can request its own teardown / completion.
+    // Held towards the plugin weakly by the closures the plugin installs.
+    var onSetupSucceeded : ((ConnectedBLEDevice) -> Void)?
+    var onSetupFailed : ((ConnectedBLEDevice, FlutterError) -> Void)?
+
     init(id:String, type:String, streamHandler:StreamHandler, result:FlutterResult?, peripheral:CBPeripheral, ports:[Port]?) {
         self.peripheral = peripheral
         self.connectResult = result
         super.init(id: id, type: type, streamHandler: streamHandler)
     }
-    
-    func setupBLE(stream: StreamHandler) {
+
+    func setupBLE(stream: StreamHandler, onSuccess: @escaping (ConnectedBLEDevice) -> Void, onFailure: @escaping (ConnectedBLEDevice, FlutterError) -> Void) {
         setupStream = stream
+        onSetupSucceeded = onSuccess
+        onSetupFailed = onFailure
         peripheral.delegate = self
         peripheral.discoverServices([CBUUID(string: "03B80E5A-EDE8-4B33-A751-6CE34EC4C700")])
     }
-    
-    
+
+    func cancelConnectTimeout() {
+        connectTimeoutTimer?.invalidate()
+        connectTimeoutTimer = nil
+    }
+
     override func close() {
         // Only tear down our own state here. The actual connection is cancelled
         // by the plugin via its shared CBCentralManager (in disconnectDevice /
         // handleBLEDeviceRemoval); a freshly constructed CBCentralManager does
         // not own this peripheral's connection and could not cancel it anyway.
+        cancelConnectTimeout()
         peripheral.delegate = nil
         characteristic = nil
     }
@@ -1948,14 +2135,25 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
     
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         print("perif didDiscoverServices  \(String(describing: peripheral.services))")
-        for service:CBService in peripheral.services! {
+        // On error the services array is nil; force-unwrapping would crash before
+        // the failure branch could run. Treat error / no services as discovery
+        // failure and tear the device down.
+        guard error == nil, let services = peripheral.services, !services.isEmpty else {
+            onSetupFailed?(self, FlutterError(code: "BLEERROR", message: error?.localizedDescription ?? "Did not discover MIDI services", details: id))
+            return
+        }
+        for service:CBService in services {
             peripheral.discoverCharacteristics(nil, for: service)
         }
     }
-    
+
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         print("perif didDiscoverCharacteristicsFor  \(String(describing: service.characteristics))")
-        for characteristic:CBCharacteristic in service.characteristics! {
+        guard error == nil, let characteristics = service.characteristics, !characteristics.isEmpty else {
+            onSetupFailed?(self, FlutterError(code: "BLEERROR", message: error?.localizedDescription ?? "Did not discover MIDI characteristics", details: id))
+            return
+        }
+        for characteristic:CBCharacteristic in characteristics {
             if characteristic.uuid.uuidString == "7772E5DB-3868-4112-A1A9-F2669D106BF3" {
                 self.characteristic = characteristic
                 peripheral.setNotifyValue(true, for: characteristic)
@@ -1963,20 +2161,12 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
                 DispatchQueue.main.async {
                     self.setupStream?.send(data: "deviceConnected")
                 }
-                
-                if let res = connectResult {
-                    print("callback result")
-                    res(nil)
-                } else {
-                    print("NO callback result")
-                }
+                onSetupSucceeded?(self)
                 return;
             }
         }
-        
-        if let res = connectResult {
-            res(FlutterError.init(code: "BLEERROR", message: "Did not discover MIDI characteristics", details: id))
-        }
+
+        onSetupFailed?(self, FlutterError(code: "BLEERROR", message: "Did not discover MIDI characteristics", details: id))
     }
     
     func createMessageEvent(_ bytes:[UInt8], timestamp:UInt64, peripheral:CBPeripheral) {
