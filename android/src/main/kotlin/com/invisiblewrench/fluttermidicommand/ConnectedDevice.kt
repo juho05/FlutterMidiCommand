@@ -1,36 +1,37 @@
 package com.invisiblewrench.fluttermidicommand
 
-import android.bluetooth.BluetoothDevice
 import android.content.pm.ServiceInfo
 import android.media.midi.*
-import android.os.Handler
 import android.util.Log
-import io.flutter.plugin.common.MethodChannel.Result
 import kotlinx.coroutines.*
 
 class ConnectedDevice : Device {
     var inputPort: MidiInputPort? = null
     var outputPort: MidiOutputPort? = null
 
+    val isBluetooth: Boolean
+        get() = isBluetoothInfo(midiDevice.info)
+
     private var isOwnVirtualDevice = false
     private var connectionJob: Job? = null
+    private var isClosed = false
 
     override val deviceInfo: Map<String, Any?>
-        get() {
-            val isBluetoothDevice = midiDevice.info.type == MidiDeviceInfo.TYPE_BLUETOOTH
-            return mapOf(
-                "id" to id,
-                "name" to midiDevice.info.properties.getString(MidiDeviceInfo.PROPERTY_NAME),
-                "type" to if (isBluetoothDevice) "BLE" else "native"
-            )
-        }
+        get() = mapOf(
+            "id" to id,
+            "name" to midiDevice.info.properties.getString(MidiDeviceInfo.PROPERTY_NAME),
+            "type" to if (isBluetooth) "BLE" else "native"
+        )
 
-    constructor(device:MidiDevice, setupStreamHandler: FMCStreamHandler) : super(deviceIdForInfo(device.info), device.info.type.toString()) {
+    constructor(device:MidiDevice, setupStreamHandler: FMCStreamHandler) : super(deviceIdForInfo(device.info), if (isBluetoothInfo(device.info)) "BLE" else "native") {
         this.midiDevice = device
         this.setupStreamHandler = setupStreamHandler
     }
 
-    override fun connectWithStreamHandler(streamHandler: FMCStreamHandler, connectResult:Result?) {
+    /// Opens the device's ports off the main thread and reports the outcome
+    /// exactly once. The device is usable the moment the ports are open, so
+    /// there is no settle delay between opening and reporting success.
+    override fun connectWithStreamHandler(streamHandler: FMCStreamHandler, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
         Log.d("FlutterMIDICommand","connectWithHandler")
 
         // Cancel any existing connection attempt
@@ -39,52 +40,55 @@ class ConnectedDevice : Device {
         // Move blocking I/O operations to background thread to prevent ANR
         connectionJob = CoroutineScope(Dispatchers.IO).launch {
             try {
-                midiDevice.info?.let { deviceInfo ->
-                    Log.d("FlutterMIDICommand","inputPorts ${deviceInfo.inputPortCount} outputPorts ${deviceInfo.outputPortCount}")
+                val info = midiDevice.info
+                Log.d("FlutterMIDICommand","inputPorts ${info.inputPortCount} outputPorts ${info.outputPortCount}")
 
-                    // Initialize receiver on background thread
-                    receiver = RXReceiver(streamHandler, midiDevice)
+                // Initialize receiver on background thread
+                receiver = RXReceiver(streamHandler, midiDevice)
 
-                    var serviceInfo = deviceInfo.properties.getParcelable<ServiceInfo>("service_info")
-                    if (serviceInfo?.name == "com.invisiblewrench.fluttermidicommand.VirtualDeviceService") {
-                        Log.d("FlutterMIDICommand", "Own virtual")
-                        isOwnVirtualDevice = true
-                    } else {
-                        if (deviceInfo.inputPortCount > 0) {
-                            Log.d("FlutterMIDICommand", "Open input port")
-                            // This is the blocking call that can cause ANR - now on background thread
-                            inputPort = midiDevice.openInputPort(0)
-                            Log.d("FlutterMIDICommand", "Input port opened successfully")
-                        }
-                    }
-
-                    if (deviceInfo.outputPortCount > 0) {
-                        Log.d("FlutterMIDICommand", "Open output port")
-                        // This can also block - keep on background thread
-                        outputPort = midiDevice.openOutputPort(0)
-                        outputPort?.connect(receiver)
-                        Log.d("FlutterMIDICommand", "Output port opened successfully")
-                    }
-
-                    // Switch back to main thread for UI updates and callbacks
-                    withContext(Dispatchers.Main) {
-                        // Use a delay to allow the device to stabilize (was 2500ms in original code)
-                        Handler().postDelayed({
-                            setupStreamHandler?.send("deviceConnected")
-                            connectResult?.success(null)
-                        }, 2500)
+                var serviceInfo = info.properties.getParcelable<ServiceInfo>("service_info")
+                if (serviceInfo?.name == "com.invisiblewrench.fluttermidicommand.VirtualDeviceService") {
+                    Log.d("FlutterMIDICommand", "Own virtual")
+                    isOwnVirtualDevice = true
+                } else {
+                    if (info.inputPortCount > 0) {
+                        Log.d("FlutterMIDICommand", "Open input port")
+                        // This is the blocking call that can cause ANR - now on background thread
+                        inputPort = midiDevice.openInputPort(0)
+                        // Null means the port is held by another client. Sending is
+                        // then unavailable, but receiving may still work, so the
+                        // connection is kept rather than failed.
+                        if (inputPort == null) Log.w("FlutterMIDICommand", "Input port unavailable, continuing without it")
+                        else Log.d("FlutterMIDICommand", "Input port opened successfully")
                     }
                 }
+
+                if (info.outputPortCount > 0) {
+                    Log.d("FlutterMIDICommand", "Open output port")
+                    // This can also block - keep on background thread
+                    outputPort = midiDevice.openOutputPort(0)
+                    if (outputPort == null) {
+                        Log.w("FlutterMIDICommand", "Output port unavailable, continuing without it")
+                    } else {
+                        Log.d("FlutterMIDICommand", "Output port opened successfully")
+                        outputPort?.connect(receiver)
+                    }
+                }
+
+                // Only a device that offered ports and yielded none is a failure.
+                val offeredPorts = info.inputPortCount > 0 || info.outputPortCount > 0
+                if (!isOwnVirtualDevice && offeredPorts && inputPort == null && outputPort == null) {
+                    throw Exception("Could not open any port")
+                }
+
+                withContext(Dispatchers.Main) { onSuccess() }
             } catch (e: CancellationException) {
                 Log.d("FlutterMIDICommand", "Connection cancelled")
                 // Don't report cancellation as an error
                 throw e
             } catch (e: Exception) {
                 Log.e("FlutterMIDICommand", "Failed to open MIDI device: ${e.message}", e)
-                // Switch to main thread for error callback
-                withContext(Dispatchers.Main) {
-                    connectResult?.error("MIDI_DEVICE_ERROR", "Failed to open MIDI device: ${e.message}", null)
-                }
+                withContext(Dispatchers.Main) { onFailure("Failed to open MIDI device: ${e.message}") }
             }
         }
     }
@@ -104,6 +108,11 @@ class ConnectedDevice : Device {
     }
 
     override fun close() {
+        // Whichever removal trigger fires first emits; later ones find the device
+        // already closed and are ignored, so the disconnect events fire exactly once.
+        if (isClosed) return
+        isClosed = true
+
         Log.d("FlutterMIDICommand", "Close device - cancelling connection job")
         // Capture device identity before tearing down, while midiDevice.info is still valid
         val info = deviceInfo
@@ -135,9 +144,9 @@ class ConnectedDevice : Device {
 
     class RXReceiver(stream: FMCStreamHandler, device: MidiDevice) : MidiReceiver() {
         val stream = stream
-        var isBluetoothDevice = device.info.type == MidiDeviceInfo.TYPE_BLUETOOTH
+        var isBluetoothDevice = Device.isBluetoothInfo(device.info)
         val deviceInfo = mapOf(
-            "id" to if (isBluetoothDevice) (device.info.properties.get(MidiDeviceInfo.PROPERTY_BLUETOOTH_DEVICE) as BluetoothDevice).address else device.info.id.toString(),
+            "id" to Device.deviceIdForInfo(device.info),
             "name" to device.info.properties.getString(MidiDeviceInfo.PROPERTY_NAME),
             "type" to if (isBluetoothDevice) "BLE" else "native"
         )

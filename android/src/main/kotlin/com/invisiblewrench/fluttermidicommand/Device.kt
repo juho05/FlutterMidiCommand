@@ -4,7 +4,6 @@ import android.bluetooth.BluetoothDevice
 import android.media.midi.MidiDevice
 import android.media.midi.MidiDeviceInfo
 import android.media.midi.MidiReceiver
-import io.flutter.plugin.common.MethodChannel.Result
 
 abstract class Device {
     var id:String
@@ -23,17 +22,24 @@ abstract class Device {
         this.type = type
     }
 
-    abstract fun connectWithStreamHandler(streamHandler: FMCStreamHandler, connectResult:Result?)
+    abstract fun connectWithStreamHandler(streamHandler: FMCStreamHandler, onSuccess: () -> Unit, onFailure: (String) -> Unit)
 
     abstract fun send(data: ByteArray, timestamp: Long?)
 
     abstract fun close()
 
     companion object {
-        fun deviceIdForInfo(info: MidiDeviceInfo): String {
-            var isBluetoothDevice = info.type == MidiDeviceInfo.TYPE_BLUETOOTH
-            var deviceId: String = if (isBluetoothDevice) (info.properties.get(MidiDeviceInfo.PROPERTY_BLUETOOTH_DEVICE) as BluetoothDevice).address else info.id.toString()
-            return deviceId
-        }
+        /// The BluetoothMidiService-backed MidiDeviceInfo does not reliably report
+        /// TYPE_BLUETOOTH, so identity is derived from the presence of the
+        /// bluetooth device property instead of the reported type. Getting this
+        /// wrong gives a BLE device a numeric id, which stops it deduping against
+        /// its scan-side entry and breaks sendData/disconnectDevice by address.
+        fun bluetoothDeviceForInfo(info: MidiDeviceInfo): BluetoothDevice? =
+            info.properties.get(MidiDeviceInfo.PROPERTY_BLUETOOTH_DEVICE) as? BluetoothDevice
+
+        fun isBluetoothInfo(info: MidiDeviceInfo): Boolean = bluetoothDeviceForInfo(info) != null
+
+        fun deviceIdForInfo(info: MidiDeviceInfo): String =
+            bluetoothDeviceForInfo(info)?.address ?: info.id.toString()
     }
 }
