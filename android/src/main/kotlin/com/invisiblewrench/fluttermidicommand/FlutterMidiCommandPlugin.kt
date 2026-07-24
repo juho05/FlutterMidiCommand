@@ -30,6 +30,13 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
   private lateinit var midiManager: MidiManager
   private lateinit var handler: Handler
 
+  /// Every system device query is a binder call, and they queue behind the
+  /// bluetooth stack's own work while a scan is running - long enough to stall
+  /// touch delivery when made on the main looper. They run here instead, and only
+  /// immutable snapshots cross back; all plugin state stays main-thread owned.
+  private var ioThread: HandlerThread? = null
+  private var ioHandler: Handler? = null
+
   private var isSupported: Boolean = false
 
   private var connectedDevices = mutableMapOf<String, ConnectedDevice>()
@@ -105,6 +112,11 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
       broadcastReceiverRegistered = false
     }
     teardownChannels()
+    // Cleared rather than probed with isAlive: quitSafely() returns while the
+    // thread is still draining, and reusing it then would silently drop posts.
+    ioThread?.quitSafely()
+    ioThread = null
+    ioHandler = null
   }
 
   override fun onAttachedToActivity(p0: ActivityPluginBinding) {
@@ -155,6 +167,11 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
     if (!::handler.isInitialized) {
       handler = Handler(context.mainLooper)
     }
+    if (ioHandler == null) {
+      val thread = HandlerThread("FlutterMIDICommand").apply { start() }
+      ioThread = thread
+      ioHandler = Handler(thread.looper)
+    }
     if (!::midiManager.isInitialized) {
       midiManager = context.getSystemService(Context.MIDI_SERVICE) as MidiManager
     }
@@ -191,16 +208,78 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
     }
   }
 
+  private class SystemSnapshot(
+    val midiInfos: List<MidiDeviceInfo>,
+    val connectedGatt: List<BluetoothDevice>,
+    val bonded: List<BluetoothDevice>,
+    val discovered: List<BluetoothDevice>,
+    val connectedIds: Set<String>,
+    val names: Map<String, String?>
+  )
+
+  /// getName() is itself a binder call, so names are resolved here alongside the
+  /// lists rather than while the snapshot is consumed on the main thread. Every
+  /// system object it touches is passed in, so no plugin field is read off the
+  /// main thread.
+  private fun readSystemSnapshot(
+    midi: MidiManager,
+    manager: BluetoothManager?,
+    adapter: BluetoothAdapter?,
+    discovered: List<BluetoothDevice>,
+    connectedIds: Set<String>
+  ): SystemSnapshot {
+    val midiInfos = midi.devices.toList()
+    val connectedGatt = manager?.getConnectedDevices(GATT_SERVER) ?: emptyList()
+    val bonded = try {
+      adapter?.bondedDevices?.toList() ?: emptyList()
+    } catch (e: SecurityException) {
+      emptyList()
+    }
+    val names = mutableMapOf<String, String?>()
+    (connectedGatt + bonded + discovered).forEach {
+      // Not getOrPut: a null name counts as absent there and would re-issue the
+      // binder call for every further occurrence of the same address.
+      if (!names.containsKey(it.address)) {
+        names[it.address] = try { it.name } catch (e: SecurityException) { null }
+      }
+    }
+    return SystemSnapshot(midiInfos, connectedGatt, bonded, discovered, connectedIds, names)
+  }
+
+  /// Returns false when the read could not be scheduled, so a caller owing a
+  /// method-channel reply can answer instead of leaving it pending forever.
+  private fun withSystemSnapshot(onMain: (SystemSnapshot) -> Unit): Boolean {
+    if (!isSupported || !::midiManager.isInitialized) return false
+    val io = ioHandler ?: return false
+    val midi = midiManager
+    val main = handler
+    val manager = blManager
+    val adapter = bluetoothAdapter
+    val discovered = discoveredDevices.toList()
+    val connectedIds = connectedDevices.keys.toSet()
+    return io.post {
+      val snapshot = readSystemSnapshot(midi, manager, adapter, discovered, connectedIds)
+      main.post { onMain(snapshot) }
+    }
+  }
+
   /// Diffs the currently connected devices against the devices the system still
   /// reports as present, emitting a disconnect for any that have disappeared.
   /// midiManager.devices contains BLE MIDI devices (keyed by their bluetooth
   /// address) as well as native/USB devices, matching the id scheme used as keys
   /// in [connectedDevices].
   private fun reconcileConnectedDevices() {
-    if (!isSupported || !::midiManager.isInitialized) return
+    withSystemSnapshot { applyReconcile(it) }
+  }
 
-    val presentIds = midiManager.devices.map { Device.deviceIdForInfo(it) }.toSet()
-    connectedDevices.keys.filter { !presentIds.contains(it) }.forEach { id ->
+  /// Only devices that were already connected when the snapshot was taken are
+  /// candidates: one that connected while the system read was in flight is
+  /// absent from [SystemSnapshot.midiInfos] through no fault of its own, and
+  /// tearing it down here would disconnect a device seconds after it opened.
+  /// The next reconcile still catches it if it really is gone.
+  private fun applyReconcile(snapshot: SystemSnapshot) {
+    val presentIds = snapshot.midiInfos.map { Device.deviceIdForInfo(it) }.toSet()
+    connectedDevices.keys.filter { snapshot.connectedIds.contains(it) && !presentIds.contains(it) }.forEach { id ->
       Log.d("FlutterMIDICommand", "reconcile: device $id no longer present, disconnecting")
       removeDevice(id, "Device disconnected")
     }
@@ -310,8 +389,13 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
       "getDevices" -> {
         // Reconcile first so a device that disappeared while we were not
         // scanning is never reported as still connected.
-        reconcileConnectedDevices()
-        result.success(listOfDevices())
+        val scheduled = withSystemSnapshot { snapshot ->
+          applyReconcile(snapshot)
+          result.success(listOfDevices(snapshot))
+        }
+        if (!scheduled) {
+          result.success(listOf<Map<String, Any>>())
+        }
       }
 
       "bluetoothState" -> {
@@ -581,11 +665,14 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
 
     Log.d("FlutterMIDICommand", "Start BLE Scan")
 
+    // Set before seeding: the seed reads the system asynchronously and bails if
+    // no scan is wanted by the time it comes back.
+    scanRequested = true
+
     // Seed peripherals the system already holds, so a device connected by
     // another app (or before this process started) still surfaces.
     seedSystemHeldDevices()
 
-    scanRequested = true
     startReconcileTimer()
     startLeScan()
     return null
@@ -596,15 +683,22 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
   /// darwin's retrieveConnectedPeripherals(withServices:) - without it any
   /// connected non-MIDI peripheral would be listed as a MIDI device.
   private fun seedSystemHeldDevices() {
-    val midiAddresses = midiManager.devices.mapNotNull { Device.bluetoothDeviceForInfo(it)?.address }.toSet()
-    blManager?.getConnectedDevices(GATT_SERVER)
-      ?.filter { midiAddresses.contains(it.address) }
-      ?.forEach {
-        if (discoveredDevices.add(it)) {
-          Log.d("FlutterMIDICommand", "seed system held device ${it.address}")
-          setupStreamHandler.send("deviceAppeared")
+    withSystemSnapshot { snapshot ->
+      // The scan may have been stopped, or the adapter gone off, while the read
+      // was in flight; adding then would resurrect entries stopScanningLeDevices,
+      // teardown or reapBluetoothState just pruned. The STATE_ON branch seeds
+      // again, so nothing is lost by bailing here.
+      if (!scanRequested || bluetoothState != "poweredOn") return@withSystemSnapshot
+      val midiAddresses = snapshot.midiInfos.mapNotNull { Device.bluetoothDeviceForInfo(it)?.address }.toSet()
+      snapshot.connectedGatt
+        .filter { midiAddresses.contains(it.address) }
+        .forEach {
+          if (discoveredDevices.add(it)) {
+            Log.d("FlutterMIDICommand", "seed system held device ${it.address}")
+            setupStreamHandler.send("deviceAppeared")
+          }
         }
-      }
+    }
   }
 
   private fun stopScanningLeDevices() {
@@ -742,7 +836,7 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
   private val bleScanner = object : ScanCallback() {
     override fun onScanResult(callbackType: Int, result: ScanResult?) {
       super.onScanResult(callbackType, result)
-      Log.d("FlutterMIDICommand", "onScanResult: ${result?.device?.address} - ${result?.device?.name}")
+      Log.d("FlutterMIDICommand", "onScanResult: ${result?.device?.address}")
       result?.also {
         if (discoveredDevices.add(it.device)) {
           setupStreamHandler.send("deviceAppeared")
@@ -816,28 +910,26 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
     return (0 until count).map { mapOf("id" to it, "connected" to false) }
   }
 
-  fun listOfDevices() : List<Map<String, Any>> {
+  private fun listOfDevices(snapshot: SystemSnapshot) : List<Map<String, Any>> {
     var list = mutableMapOf<String, Map<String, Any>>()
 
 
     // Bonded BT devices
     var connectedGattDeviceIds = mutableListOf<String>()
-    var connectedGattDevices = blManager?.getConnectedDevices(GATT_SERVER)
-    connectedGattDevices?.forEach {
-      Log.d("FlutterMIDICommand", "connectedGattDevice ${it.address} type ${it.type} name ${it.name}")
+    snapshot.connectedGatt.forEach {
+      Log.d("FlutterMIDICommand", "connectedGattDevice ${it.address}")
       connectedGattDeviceIds.add(it.address)
     }
 
   var bondedDeviceIds = mutableListOf<String>()
-    var bondedDevices = bluetoothAdapter?.getBondedDevices()
-    bondedDevices?.forEach {
-      Log.d("FlutterMIDICommand", "add bonded device ${it.address} type ${it.type} name ${it.name}")
+    snapshot.bonded.forEach {
+      Log.d("FlutterMIDICommand", "add bonded device ${it.address}")
       bondedDeviceIds.add(it.address)
 
       var id = it.address
       if (connectedGattDeviceIds.contains(id)) {
         list[id] = mapOf(
-          "name" to it.name,
+          "name" to (snapshot.names[id] ?: "-"),
           "id" to id,
           "type" to "bonded",
           "connected" to if (connectedDevices.contains(it.address)) "true" else "false",///*if (connectedGattDeviceIds.contains(id)) "true" else*/ "false",
@@ -847,17 +939,18 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
       }
     }
 
-    // Discovered BLE devices
-    discoveredDevices.forEach {
+    // Discovered BLE devices, filtered against the live set: applyReconcile runs
+    // on this same snapshot and may have dropped one of them since.
+    snapshot.discovered.filter { discoveredDevices.contains(it) }.forEach {
       var id = it.address;
-      Log.d("FlutterMIDICommand", "add discovered device $ type ${it.type}")
+      Log.d("FlutterMIDICommand", "add discovered device ${it.address}")
 
       if (list.contains(id)) {
         Log.d("FlutterMIDICommand", "device already in list $id")
       } else {
-        Log.d("FlutterMIDICommand", "add native device $id type ${it.type}")
+        Log.d("FlutterMIDICommand", "add native device $id")
         list[id] = mapOf(
-          "name" to it.name,
+          "name" to (snapshot.names[id] ?: "-"),
           "id" to id,
           "type" to "BLE",
           "connected" to if (connectedDevices.contains(id)) "true" else "false",
@@ -868,15 +961,14 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
     }
 
     // Generic MIDI devices
-    val devs:Array<MidiDeviceInfo> = midiManager.devices
-    devs.forEach {
+    snapshot.midiInfos.forEach {
       var id = Device.deviceIdForInfo(it)
       Log.d("FlutterMIDICommand", "add device from midiManager id $id")
 
       if (list.contains(id)) {
         Log.d("FlutterMIDICommand", "device already in list $id")
       } else {
-        Log.d("FlutterMIDICommand", "add native device $id type ${it.type}")
+        Log.d("FlutterMIDICommand", "add native device $id")
 
         // A bluetooth-backed device stays BLE/bonded even when it only shows up
         // here, which is the common case for a connected device once the
