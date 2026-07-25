@@ -1,10 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 
-import 'package:flutter/foundation.dart';
-import 'package:universal_ble/universal_ble.dart';
+import 'package:flutter/services.dart';
 
 import 'alsa/alsa_midi_device.dart';
 import 'ble_midi_device.dart';
+import 'ble_midi_manager.dart';
 import 'midi_command_platform_interface.dart';
 
 class LinuxMidiDevice extends MidiDevice {
@@ -84,8 +85,14 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   Map<String, LinuxMidiDevice> _connectedDevices =
       Map<String, LinuxMidiDevice>();
 
-  String _bleState = "unknown";
-  Map<String, BLEMidiDevice> _discoveredBLEDevices = {};
+  late final BleMidiManager _bleManager;
+
+  /// The ALSA device ids seen by the last enumeration, diffed against a fresh
+  /// one to turn a /dev/snd change into appear/disappear events. Null until the
+  /// first enumeration, which only seeds it.
+  Set<String>? _knownNativeIds;
+  StreamSubscription<FileSystemEvent>? _sndWatch;
+  Timer? _sndDebounce;
 
   /// A constructor that allows tests to override the window object used by the plugin.
   FlutterMidiCommandLinux() {
@@ -94,24 +101,25 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
     _deviceDisconnectedStream = _deviceDisconnectedController.stream;
     _bluetoothStateStream = _bluetoothStateStreamController.stream;
 
+    _bleManager = BleMidiManager(
+      rxStreamController: _rxStreamController,
+      onSetupEvent: (event) => _setupStreamController.add(event),
+      onDeviceDisconnected: (device) =>
+          _deviceDisconnectedController.add(device),
+      onBluetoothState: (state) => _bluetoothStateStreamController.add(state),
+    );
+
     // Notify clients when a connected device is unexpectedly removed (e.g.
-    // unplugged). For an explicit disconnect the device has already been removed
-    // from [_connectedDevices] (and the event emitted) in disconnectDevice, so
-    // this only fires for unexpected drops.
+    // unplugged). The underlying ALSA device is already torn down by the time
+    // this fires; the removal path below just cancels our rx subscription,
+    // marks the wrapper disconnected and emits.
     AlsaMidiDevice.onDeviceDisconnected.listen((alsaDevice) {
-      var id = AlsaMidiDevice.hardwareId(
-        alsaDevice.cardId,
-        alsaDevice.deviceId,
+      _removeNativeDevice(
+        AlsaMidiDevice.hardwareId(alsaDevice.cardId, alsaDevice.deviceId),
       );
-      var device = _connectedDevices.remove(id);
-      if (device != null) {
-        // The underlying ALSA device is already torn down; this just cancels our
-        // rx subscription and marks the wrapper disconnected.
-        device.disconnect();
-        _deviceDisconnectedController.add(device);
-        _setupStreamController.add("deviceDisconnected");
-      }
     });
+
+    _startNativeDeviceWatch();
   }
 
   /// The linux implementation of [MidiCommandPlatform]
@@ -122,12 +130,106 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
     MidiCommandPlatform.instance = FlutterMidiCommandLinux();
   }
 
+  /// ALSA has no hot-plug notification of its own, so watch the device nodes
+  /// instead: the kernel creates and removes /dev/snd/midiC*D* as cards come and
+  /// go. This is what CoreMIDI's notifications are on darwin and DeviceManager
+  /// is on Windows, without polling ALSA on a timer.
+  void _startNativeDeviceWatch() {
+    if (_sndWatch != null) return;
+    try {
+      _sndWatch = Directory('/dev/snd')
+          .watch(events: FileSystemEvent.create | FileSystemEvent.delete)
+          .listen(
+            (_) {
+              // A single plug event churns several nodes and the MIDI one does
+              // not necessarily come last, so coalesce before enumerating.
+              _sndDebounce?.cancel();
+              _sndDebounce = Timer(reconcileDebounce, _refreshNativeDevices);
+            },
+            onError: (e) {
+              print("failed to watch /dev/snd: $e");
+            },
+          );
+    } catch (e) {
+      print("failed to watch /dev/snd: $e");
+    }
+  }
+
+  /// Diffs the present ALSA devices against the last enumeration and emits the
+  /// appear/disappear events, plus a disconnect for every connected device that
+  /// vanished.
+  void _refreshNativeDevices() {
+    List<AlsaMidiDevice> present;
+    try {
+      present = AlsaMidiDevice.getDevices();
+    } catch (e) {
+      print("failed to enumerate ALSA devices: $e");
+      return;
+    }
+    _applyNativeIds(
+      present
+          .map(
+            (device) =>
+                AlsaMidiDevice.hardwareId(device.cardId, device.deviceId),
+          )
+          .toSet(),
+    );
+  }
+
+  void _applyNativeIds(Set<String> presentIds) {
+    var known = _knownNativeIds;
+    _knownNativeIds = presentIds;
+    if (known == null) return;
+
+    if (presentIds.difference(known).isNotEmpty) {
+      _setupStreamController.add("deviceAppeared");
+    }
+
+    var removed = known.difference(presentIds);
+    for (var id in removed) {
+      _removeNativeDevice(id);
+    }
+    if (removed.isNotEmpty) {
+      _setupStreamController.add("deviceDisappeared");
+    }
+  }
+
+  /// The single removal path for native devices. Idempotent: whichever trigger
+  /// fires first (explicit disconnect, the rx isolate noticing the unplug, the
+  /// /dev/snd diff, teardown) removes the entry and emits, later ones find it
+  /// gone. Explicit and unexpected removals are indistinguishable to the client.
+  void _removeNativeDevice(String deviceId) {
+    var device = _connectedDevices.remove(deviceId);
+    if (device == null) return;
+    device.disconnect();
+    _setupStreamController.add("deviceDisconnected");
+    _deviceDisconnectedController.add(device);
+  }
+
   @override
   Future<List<MidiDevice>> get devices async {
+    // Reconcile BLE first so a device that dropped while nothing was watching is
+    // never reported as still connected.
+    await _bleManager.reconcile();
+
     // Enumerate fresh each time so unplugged/replugged devices aren't served
     // from a stale cache. getDevices() already returns the live objects for
     // currently-connected devices, so connections are preserved.
-    List<MidiDevice> devices = AlsaMidiDevice.getDevices()
+    var alsaDevices = AlsaMidiDevice.getDevices();
+
+    // Feed the enumeration we just did into the hot-plug diff before building
+    // the list, so a device that vanished is reaped rather than listed as still
+    // connected, and so the next /dev/snd change is compared against this state.
+    _applyNativeIds(
+      alsaDevices
+          .map(
+            (device) =>
+                AlsaMidiDevice.hardwareId(device.cardId, device.deviceId),
+          )
+          .toSet(),
+    );
+
+    List<MidiDevice> devices = alsaDevices
         .map<MidiDevice>(
           (alsMidiDevice) => LinuxMidiDevice(
             alsMidiDevice,
@@ -148,7 +250,7 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
 
     // Append BLE devices discovered/connected via the (cross-platform)
     // universal_ble backend, which uses BlueZ on Linux.
-    devices.addAll(_discoveredBLEDevices.values);
+    devices.addAll(_bleManager.devices.values);
 
     return devices;
   }
@@ -159,62 +261,7 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   /// universal_ble backend. Requires a running bluetoothd.
   @override
   Future<void> startBluetoothCentral() async {
-    UniversalBle.timeout = const Duration(seconds: 10);
-
-    UniversalBle.onAvailabilityChange = (state) {
-      _bleState = state.name;
-      _bluetoothStateStreamController.add(state.name);
-    };
-
-    UniversalBle.onScanResult = (result) {
-      if (!_discoveredBLEDevices.containsKey(result.deviceId)) {
-        if (result.name != null) {
-          debugPrint(
-            "${result.name} ${result.deviceId} ${result.manufacturerDataList.map((e) => e.toString()).join(', ')}",
-          );
-          _discoveredBLEDevices[result.deviceId] = BLEMidiDevice(
-            result.deviceId,
-            result.name!,
-            _rxStreamController,
-          );
-          _setupStreamController.add('deviceAppeared');
-        }
-      }
-    };
-
-    UniversalBle.onConnectionChange = (deviceId, isConnected, error) {
-      if (_discoveredBLEDevices.containsKey(deviceId)) {
-        if (isConnected) {
-          _discoveredBLEDevices[deviceId]!.connectionState =
-              BleConnectionState.connected;
-          _setupStreamController.add('deviceConnected');
-        } else {
-          // Only treat this as a disconnect if we were actually connected, so we
-          // don't emit for a discovered-but-never-connected device that drops.
-          // Keep the device in the discovered list so it stays reconnectable
-          // without requiring a new scan.
-          var device = _discoveredBLEDevices[deviceId];
-          if (device != null && device.connected) {
-            device.connected = false;
-            _setupStreamController.add('deviceDisconnected');
-            _deviceDisconnectedController.add(device);
-          }
-        }
-      }
-    };
-
-    UniversalBle.onValueChange =
-        (deviceId, characteristicId, Uint8List data, int? timestamp) {
-          if (_discoveredBLEDevices.containsKey(deviceId)) {
-            _discoveredBLEDevices[deviceId]!.handleData(data);
-          }
-        };
-
-    UniversalBle.onPairingStateChange = (deviceId, isPaired) {
-      if (_discoveredBLEDevices.containsKey(deviceId)) {
-        _discoveredBLEDevices[deviceId]!.pairingState = isPaired;
-      }
-    };
+    await _bleManager.start();
   }
 
   /// Stream firing events whenever a change in bluetooth central state happens
@@ -226,38 +273,28 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   /// Returns the current state of the bluetooth subsystem
   @override
   Future<String> bluetoothState() async {
-    return _bleState;
+    return _bleManager.state;
   }
 
   /// Starts scanning for BLE MIDI devices.
   ///
   /// Found devices will be included in the list returned by [devices].
+  /// Throws when Bluetooth is not available.
   @override
   Future<void> startScanningForBluetoothDevices() async {
-    try {
-      await UniversalBle.startScan(
-        scanFilter: ScanFilter(withServices: [MIDI_SERVICE_ID]),
-      );
-    } catch (e) {
-      print(e.toString());
-    }
+    await _bleManager.startScanning();
   }
 
   /// Stops scanning for BLE MIDI devices.
   @override
   void stopScanningForBluetoothDevices() {
-    UniversalBle.stopScan();
-
-    // Prune discovered-but-not-connected devices so a later [devices] call no
-    // longer lists BLE peripherals that went out of range while scanning (BLE
-    // provides no "scan result removed" event, so this is the point at which we
-    // know the discovered set is stale). Connected devices are kept since the
-    // active session - data reception and disconnect - relies on their entry
-    // here. Mirrors the Windows backend.
-    _discoveredBLEDevices.removeWhere((_, device) => !device.connected);
+    _bleManager.stopScanning();
   }
 
   /// Connects to the device.
+  ///
+  /// The returned future resolves once the device is usable, and throws a
+  /// [PlatformException] if the connection could not be established.
   @override
   Future<void> connectToDevice(
     MidiDevice device, {
@@ -266,62 +303,48 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
     print('connect to $device');
 
     if (device is BLEMidiDevice) {
-      // The connected event is emitted from the onConnectionChange callback.
-      device.connect();
-      return;
+      return _bleManager.connect(device);
     }
 
     var linuxDevice = device as LinuxMidiDevice;
-    final success = await linuxDevice.connect();
-    if (success) {
-      _connectedDevices[device.id] = device;
-      _setupStreamController.add("deviceConnected");
-    } else {
-      print("failed to connect $linuxDevice");
+    if (_connectedDevices.containsKey(linuxDevice.id)) {
+      throw PlatformException(
+        code: 'MESSAGEERROR',
+        message: 'Device already connected',
+        details: linuxDevice.id,
+      );
     }
+
+    if (!await linuxDevice.connect()) {
+      _setupStreamController.add("connectionFailed");
+      throw PlatformException(
+        code: 'MESSAGEERROR',
+        message: 'Failed to open device',
+        details: linuxDevice.id,
+      );
+    }
+    _connectedDevices[linuxDevice.id] = linuxDevice;
+    _setupStreamController.add("deviceConnected");
   }
 
   /// Disconnects from the device.
   @override
-  void disconnectDevice(MidiDevice device, {bool remove = true}) {
+  void disconnectDevice(MidiDevice device) {
     if (device is BLEMidiDevice) {
-      // The disconnect event is emitted from the onConnectionChange callback.
-      device.disconnect();
+      _bleManager.disconnect(device);
       return;
     }
 
     // Operate on the stored connected device, not the passed-in wrapper, which
     // may be a fresh instance from a later devices() enumeration wrapping the
     // same underlying device.
-    var linuxDevice = _connectedDevices[device.id];
-    if (linuxDevice != null) {
-      linuxDevice.disconnect();
-      if (remove) {
-        _connectedDevices.remove(device.id);
-        _setupStreamController.add("deviceDisconnected");
-        _deviceDisconnectedController.add(linuxDevice);
-      }
-    }
+    _removeNativeDevice(device.id);
   }
 
   @override
   void teardown() {
-    _connectedDevices.values.forEach((device) {
-      disconnectDevice(device, remove: false);
-      device.connected = false;
-      _deviceDisconnectedController.add(device);
-    });
-    _connectedDevices.clear();
-
-    // Disconnect any connected BLE devices as well. Their disconnect event is
-    // emitted from the onConnectionChange callback.
-    _discoveredBLEDevices.values.where((device) => device.connected).forEach((
-      device,
-    ) {
-      disconnectDevice(device, remove: false);
-    });
-
-    _setupStreamController.add("deviceDisconnected");
+    _connectedDevices.keys.toList().forEach(_removeNativeDevice);
+    _bleManager.teardown();
     // Do not close _rxStreamController here: teardown only disconnects devices
     // (matching the documented contract and the darwin/Android backends).
     // Closing the broadcast controller would leave the plugin instance unusable
@@ -337,11 +360,8 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       // Send to a specific device, if present.
       _connectedDevices[deviceId]?.send(data, data.length);
 
-      _discoveredBLEDevices.values
-          .where((device) => device.deviceId == deviceId)
-          .forEach((device) {
-            device.send(data);
-          });
+      var bleDevice = _bleManager.devices[deviceId];
+      if (bleDevice != null && bleDevice.connected) bleDevice.send(data);
     } else {
       // Send to all connected devices.
       _connectedDevices.values.forEach((device) {
@@ -349,7 +369,7 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
         device.send(data, data.length);
       });
 
-      _discoveredBLEDevices.values.where((device) => device.connected).forEach((
+      _bleManager.devices.values.where((device) => device.connected).forEach((
         device,
       ) {
         device.send(data);
@@ -386,14 +406,22 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   @override
   void addVirtualDevice({String? name}) {
     // Not implemented
+    print('addVirtualDevice not implemented on Linux');
   }
 
   /// Removes a previously addd virtual MIDI source.
   @override
   void removeVirtualDevice({String? name}) {
     // Not implemented
+    print('removeVirtualDevice not implemented on Linux');
   }
 
   @override
   Future<bool?> get isNetworkSessionEnabled async => null;
+
+  @override
+  void setNetworkSessionEnabled(bool enabled) {
+    // Not implemented
+    print('setNetworkSessionEnabled not implemented on Linux');
+  }
 }

@@ -16,13 +16,14 @@ class WindowsMidiDevice extends MidiDevice {
   Map<int, MIDIOUTCAPS> _outs = {};
 
   StreamController<MidiPacket> _rxStreamCtrl;
-  StreamController<String> _setupStreamController;
 
-  final hMidiInDevicePtr = malloc<Pointer>();
-  final hMidiOutDevicePtr = malloc<Pointer>();
+  /// Allocated per connect and freed on disconnect, so a device object survives
+  /// a disconnect/reconnect cycle instead of writing through freed memory.
+  Pointer<Pointer<NativeType>>? _hMidiInDevicePtr;
+  Pointer<Pointer<NativeType>>? _hMidiOutDevicePtr;
 
-  HMIDIIN get _hMidiIn => HMIDIIN(hMidiInDevicePtr.value);
-  HMIDIOUT get _hMidiOut => HMIDIOUT(hMidiOutDevicePtr.value);
+  HMIDIIN get _hMidiIn => HMIDIIN(_hMidiInDevicePtr!.value);
+  HMIDIOUT get _hMidiOut => HMIDIOUT(_hMidiOutDevicePtr!.value);
 
   int callbackAddress;
 
@@ -35,7 +36,7 @@ class WindowsMidiDevice extends MidiDevice {
   Pointer<BYTE> _midiOutBuffer = nullptr;
 
   WindowsMidiDevice(String id, String name, this._rxStreamCtrl,
-      this._setupStreamController, this.callbackAddress)
+      this.callbackAddress)
       : super(id, name, 'native', false);
 
   /// Connect to the device, ie. open input and output ports
@@ -45,11 +46,16 @@ class WindowsMidiDevice extends MidiDevice {
 
     var mIn = _ins.entries.firstOrNull;
     if (mIn != null) {
-      var id = mIn.key;
-      int result = midiInOpen(
-          hMidiInDevicePtr, id, callbackAddress, 0, CALLBACK_FUNCTION);
+      var inPtr = malloc<Pointer>();
+      _hMidiInDevicePtr = inPtr;
+      int result =
+          midiInOpen(inPtr, mIn.key, callbackAddress, 0, CALLBACK_FUNCTION);
       if (result != 0) {
         print("OPEN ERROR($result): ${midiErrorMessage(result)}");
+        // Nothing was opened, so release the handle cell again rather than
+        // letting close() issue calls on it.
+        free(inPtr);
+        _hMidiInDevicePtr = null;
         return false;
       } else {
         // Setup buffer
@@ -65,6 +71,7 @@ class WindowsMidiDevice extends MidiDevice {
               _hMidiIn, _midiInHeaders[i], sizeOf<MIDIHDR>());
           if (result != 0) {
             print("HDR PREP ERROR: ${midiErrorMessage(result)}");
+            close();
             return false;
           }
 
@@ -72,6 +79,7 @@ class WindowsMidiDevice extends MidiDevice {
               _hMidiIn, _midiInHeaders[i], sizeOf<MIDIHDR>());
           if (result != 0) {
             print("HDR ADD ERROR: ${midiErrorMessage(result)}");
+            close();
             return false;
           }
         }
@@ -79,6 +87,7 @@ class WindowsMidiDevice extends MidiDevice {
         result = midiInStart(_hMidiIn);
         if (result != 0) {
           print("START ERROR: ${midiErrorMessage(result)}");
+          close();
           return false;
         }
       }
@@ -87,11 +96,15 @@ class WindowsMidiDevice extends MidiDevice {
     // Open output
     var mOut = _outs.entries.firstOrNull;
     if (mOut != null) {
-      var id = mOut.key;
+      var outPtr = malloc<Pointer>();
+      _hMidiOutDevicePtr = outPtr;
 
-      int result = midiOutOpen(hMidiOutDevicePtr, id, 0, 0, CALLBACK_NULL);
+      int result = midiOutOpen(outPtr, mOut.key, 0, 0, CALLBACK_NULL);
       if (result != 0) {
-        print("OUT OPEN ERROR: result");
+        print("OUT OPEN ERROR($result): ${midiErrorMessage(result)}");
+        free(outPtr);
+        _hMidiOutDevicePtr = null;
+        close();
         return false;
       }
 
@@ -99,55 +112,60 @@ class WindowsMidiDevice extends MidiDevice {
       _midiOutHeader = malloc<MIDIHDR>();
     }
     connected = true;
-    _setupStreamController.add("deviceConnected");
     return true;
   }
 
-  bool disconnect() {
-    int result;
-    if (_ins.length > 0) {
-      result = midiInReset(_hMidiIn);
-      if (result != 0) {
-        print("RESET ERROR($result): ${midiErrorMessage(result)}");
-      }
+  /// Tears down whatever is currently open or allocated. Best effort and safe to
+  /// call twice: it is also the cleanup path for a device that is already gone
+  /// (unplugged), where every call below fails harmlessly.
+  void close() {
+    var inPtr = _hMidiInDevicePtr;
+    if (inPtr != null) {
+      var hMidiIn = HMIDIIN(inPtr.value);
+      _logError("RESET", midiInReset(hMidiIn));
 
-      for (int i=0; i < _numberOfBuffers; i++) {
+      for (int i = 0; i < _numberOfBuffers; i++) {
         if (_midiInHeaders[i] != nullptr) {
-          midiInUnprepareHeader(
-              _hMidiIn, _midiInHeaders[i], sizeOf<MIDIHDR>());
+          midiInUnprepareHeader(hMidiIn, _midiInHeaders[i], sizeOf<MIDIHDR>());
           free(_midiInHeaders[i]);
+          _midiInHeaders[i] = nullptr;
         }
         if (_midiInBuffers[i] != nullptr) {
           free(_midiInBuffers[i]);
+          _midiInBuffers[i] = nullptr;
         }
       }
 
-      result = midiInStop(_hMidiIn);
-      if (result != 0) {
-        print("STOP ERROR($result): ${midiErrorMessage(result)}");
-      }
+      _logError("STOP", midiInStop(hMidiIn));
+      _logError("CLOSE", midiInClose(hMidiIn));
 
-      result = midiInClose(_hMidiIn);
-      if (result != 0) {
-        print("CLOSE ERROR($result): ${midiErrorMessage(result)}");
-      }
-
-      free(hMidiInDevicePtr);
+      free(inPtr);
+      _hMidiInDevicePtr = null;
     }
 
-    if (_outs.length > 0) {
-      result = midiOutClose(_hMidiOut);
-      if (result != 0) {
-        print("OUT CLOSE ERROR($result): ${midiErrorMessage(result)}");
-      }
-      free(hMidiOutDevicePtr);
+    var outPtr = _hMidiOutDevicePtr;
+    if (outPtr != null) {
+      _logError("OUT CLOSE", midiOutClose(HMIDIOUT(outPtr.value)));
+      free(outPtr);
+      _hMidiOutDevicePtr = null;
     }
 
-    free(_midiOutBuffer);
-    free(_midiOutHeader);
+    if (_midiOutBuffer != nullptr) {
+      free(_midiOutBuffer);
+      _midiOutBuffer = nullptr;
+    }
+    if (_midiOutHeader != nullptr) {
+      free(_midiOutHeader);
+      _midiOutHeader = nullptr;
+    }
 
     connected = false;
-    return true;
+  }
+
+  void _logError(String what, int result) {
+    if (result != 0) {
+      print("$what ERROR($result): ${midiErrorMessage(result)}");
+    }
   }
 
   addInput(int id, MIDIINCAPS input) {
@@ -162,7 +180,7 @@ class WindowsMidiDevice extends MidiDevice {
 
   // The callback delivers the input handle as a raw address (see _onMidiData),
   // so compare against the handle pointer's address rather than the pointer.
-  containsMidiIn(int input) => hMidiInDevicePtr.value.address == input;
+  containsMidiIn(int input) => _hMidiInDevicePtr?.value.address == input;
 
   _resetHeader(Pointer<MIDIHDR> midiHdrPointer) {
     midiInAddBuffer(_hMidiIn, midiHdrPointer, sizeOf<MIDIHDR>());
@@ -201,6 +219,12 @@ class WindowsMidiDevice extends MidiDevice {
   }
 
   send(Uint8List data) async {
+    // No output port open, either because the device has none or because it is
+    // not connected.
+    if (_hMidiOutDevicePtr == null ||
+        _midiOutBuffer == nullptr ||
+        _midiOutHeader == nullptr) return;
+
     // Set data in out buffer
     _midiOutBuffer.asTypedList(data.length).setAll(0, data);
     _midiOutHeader.ref.lpData = PSTR(_midiOutBuffer.cast());

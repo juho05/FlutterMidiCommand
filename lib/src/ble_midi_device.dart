@@ -28,23 +28,14 @@ class BLEMidiDevice extends MidiDevice {
   /// bytes of ATT overhead) and is raised once the larger MTU is negotiated.
   int _maxWriteSize = 20;
 
-  set connectionState(BleConnectionState state) {
-    UniversalBle.requestMtu(deviceId, 247).then((mtu) {
-      if (mtu > 3) _maxWriteSize = mtu - 3;
-    }).catchError((e) {
-      // Some platforms/peripherals don't support MTU negotiation; the 20-byte
-      // default keeps working.
-      print('requestMtu failed: $e');
-    });
+  /// When the current connect attempt was started. The reconcile pass measures
+  /// its grace periods from here.
+  DateTime connectRequestTime = DateTime.now();
 
-    if (devState.index < DeviceState.Interrogating.index) {
-      _discoverServices();
-    }
-    connected = (state == BleConnectionState.connected);
-  }
+  bool get hasMidiCharacteristic => _midiCharacteristic != null;
 
   set pairingState(bool value) {
-    if (value == true) {
+    if (value == true && _midiCharacteristic != null) {
       _startNotify();
     }
   }
@@ -54,13 +45,83 @@ class BLEMidiDevice extends MidiDevice {
 
   BLEMidiDevice(this.deviceId, this.name, this._rxStreamCtrl) : super(deviceId, name, 'BLE', false) {}
 
-  connect() {
-    UniversalBle.connect(deviceId);
+  /// Negotiates a usable MTU, looks for the BLE MIDI characteristic and
+  /// subscribes to it. Returns false when the peripheral carries no BLE MIDI
+  /// characteristic, ie. the link is up but unusable for MIDI.
+  Future<bool> discoverMidiService({required Duration timeout}) async {
+    devState = DeviceState.Interrogating;
+
+    try {
+      var mtu = await UniversalBle.requestMtu(deviceId, 247);
+      if (mtu > 3) _maxWriteSize = mtu - 3;
+    } catch (e) {
+      // Some platforms/peripherals don't support MTU negotiation; the 20-byte
+      // default keeps working.
+      print('requestMtu failed: $e');
+    }
+
+    var services = await UniversalBle.discoverServices(deviceId, timeout: timeout);
+    _midiService = services.where((service) => service.uuid.toUpperCase() == MIDI_SERVICE_ID).firstOrNull;
+    _midiCharacteristic = _midiService?.characteristics.where((characteristic) => characteristic.uuid.toUpperCase() == MIDI_CHARACTERISTIC_ID).firstOrNull;
+    if (_midiCharacteristic == null) {
+      devState = DeviceState.Irrelevant;
+      return false;
+    }
+    devState = DeviceState.Available;
+
+    // Subscribe to the MIDI characteristic up front, before (and regardless
+    // of) pairing. BLE-MIDI does not mandate bonding and many peripherals
+    // (the "Just Works" case, common on Linux/BlueZ) deliver notifications
+    // without ever pairing, so gating data reception on a successful pairing
+    // would leave such devices connected but silent. On peripherals that do
+    // require encryption this triggers on-demand authentication or fails
+    // harmlessly (the error is caught in _startNotify); the pairing below, and
+    // the re-subscribe from the pairing-state callback, cover the bonded case.
+    // Subscribing twice is a no-op.
+    await _startNotify();
+
+    // Deliberately not awaited: the characteristic is already subscribed, so
+    // the device is usable now. Pairing may block on an agent interaction that
+    // never comes, which must not hold up the connect result.
+    _pairIfNeeded();
+    return true;
   }
 
-  disconnect() {
-    UniversalBle.unsubscribe(deviceId, _midiService!.uuid, _midiCharacteristic!.uuid);
-    UniversalBle.disconnect(deviceId);
+  /// Unsubscribes from the MIDI characteristic. Best effort: the link may
+  /// already be gone (cancelled connect, half-open link, unexpected drop), in
+  /// which case there is nothing left to unsubscribe from.
+  Future<void> unsubscribe() async {
+    var service = _midiService;
+    var characteristic = _midiCharacteristic;
+    if (service == null || characteristic == null) return;
+    try {
+      await UniversalBle.unsubscribe(deviceId, service.uuid, characteristic.uuid);
+    } catch (e) {
+      print('unsubscribe failed: $e');
+    }
+  }
+
+  /// Drops the per-session state so a later reconnect rediscovers everything
+  /// and no half-parsed message survives into the new session.
+  void handleDisconnected() {
+    connected = false;
+    devState = DeviceState.None;
+    _midiService = null;
+    _midiCharacteristic = null;
+    _maxWriteSize = 20;
+    bleHandlerState = BLE_HANDLER_STATE.HEADER;
+    sysExBuffer.clear();
+    bleMidiBuffer.clear();
+    bleSysExHasFinished = true;
+  }
+
+  _pairIfNeeded() async {
+    try {
+      var isPaired = await UniversalBle.isPaired(deviceId) ?? false;
+      if (!isPaired) await UniversalBle.pair(deviceId);
+    } catch (e) {
+      print('pair failed: $e');
+    }
   }
 
   send(Uint8List bytes) async {
@@ -164,46 +225,11 @@ class BLEMidiDevice extends MidiDevice {
     _parseBLEPacket(data);
   }
 
-  _discoverServices() async {
-    devState = DeviceState.Interrogating;
-
-    var services = await UniversalBle.discoverServices(deviceId);
-    _midiService = services.where((service) => service.uuid.toUpperCase() == MIDI_SERVICE_ID).firstOrNull;
-    if (_midiService != null) {
-      _midiCharacteristic = _midiService!.characteristics.where((characteristic) => characteristic.uuid.toUpperCase() == MIDI_CHARACTERISTIC_ID).firstOrNull;
-      if (_midiCharacteristic != null) {
-        // Subscribe to the MIDI characteristic up front, before (and regardless
-        // of) pairing. BLE-MIDI does not mandate bonding and many peripherals
-        // (the "Just Works" case, common on Linux/BlueZ) deliver notifications
-        // without ever pairing, so gating data reception on a successful pairing
-        // would leave such devices connected but silent. On peripherals that do
-        // require encryption this triggers on-demand authentication or fails
-        // harmlessly (the error is caught in _startNotify); the explicit pair()
-        // below, and the re-subscribe from the pairing-state callback, cover the
-        // bonded case. Subscribing twice is a no-op.
-        _startNotify();
-
-        var isPaired = await UniversalBle.isPaired(deviceId) ?? false;
-        if (!isPaired) {
-          try {
-            await UniversalBle.pair(deviceId);
-          } catch (e) {
-            print(e);
-          }
-        }
-      } else {
-        devState = DeviceState.Irrelevant;
-      }
-    } else {
-      devState = DeviceState.Irrelevant;
-    }
-  }
-
-  _startNotify() {
+  _startNotify() async {
     try {
-      UniversalBle.subscribeNotifications(deviceId, _midiService!.uuid, _midiCharacteristic!.uuid);
+      await UniversalBle.subscribeNotifications(deviceId, _midiService!.uuid, _midiCharacteristic!.uuid);
     } catch (e) {
-      print(e);
+      print('subscribeNotifications failed: $e');
     }
   }
 

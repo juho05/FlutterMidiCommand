@@ -466,7 +466,9 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
       }
 
       "isNetworkSessionEnabled" -> {
-        result.success(false)
+        // null means "not supported here", as on every backend but iOS. false
+        // would read as a network session that exists and is switched off.
+        result.success(null)
       }
 
       "enableNetworkSession" -> {

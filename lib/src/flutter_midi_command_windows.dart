@@ -5,11 +5,11 @@ import 'dart:typed_data';
 import 'package:device_manager/device_event.dart';
 import 'package:device_manager/device_manager.dart';
 import 'package:ffi/ffi.dart';
-import 'package:flutter/foundation.dart';
-import 'package:universal_ble/universal_ble.dart';
+import 'package:flutter/services.dart';
 import 'package:win32/win32.dart';
 
 import 'ble_midi_device.dart';
+import 'ble_midi_manager.dart';
 import 'midi_command_platform_interface.dart';
 import 'windows_midi_device.dart';
 
@@ -32,10 +32,7 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   Map<String, WindowsMidiDevice> _connectedDevices =
       Map<String, WindowsMidiDevice>();
 
-  // BLE Vars
-
-  String _bleState = "unknown";
-  Map<String, BLEMidiDevice> _discoveredBLEDevices = {};
+  late final BleMidiManager _bleManager;
 
   factory FlutterMidiCommandWindows() {
     if (_instance == null) {
@@ -52,19 +49,34 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
     _bluetoothStateStream = _bluetoothStateStreamController.stream;
     _deviceDisconnectedStream = _deviceDisconnectedController.stream;
 
-    _setupDeviceManager();
+    _bleManager = BleMidiManager(
+      rxStreamController: _rxStreamController,
+      onSetupEvent: (event) => _setupStreamController.add(event),
+      onDeviceDisconnected: (device) =>
+          _deviceDisconnectedController.add(device),
+      onBluetoothState: (state) => _bluetoothStateStreamController.add(state),
+    );
   }
 
-  _setupDeviceManager() async {
-    await Future.delayed(Duration(seconds: 3));
+  bool _deviceManagerReady = false;
+
+  /// Subscribes to native hot-plug events. DeviceManager talks over a method
+  /// channel, which cannot be touched from the plugin registrant that
+  /// constructs this class - the binding does not exist yet at that point - so
+  /// this is hooked up on the first call coming from the app instead. That is
+  /// also the earliest moment at which an event could matter to anyone.
+  void _ensureDeviceManager() {
+    if (_deviceManagerReady) return;
+    _deviceManagerReady = true;
+
     DeviceManager().addListener(() {
       var event = DeviceManager().lastEvent;
       if (event != null) {
         if (event.eventType == EventType.add) {
           _setupStreamController.add("deviceAppeared");
         } else if (event.eventType == EventType.remove) {
-          _setupStreamController.add("deviceDisappeared");
           _handleNativeDeviceRemoval();
+          _setupStreamController.add("deviceDisappeared");
         }
       }
     });
@@ -80,6 +92,11 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   //#region
   @override
   Future<List<MidiDevice>> get devices async {
+    _ensureDeviceManager();
+    // Reconcile BLE first so a device that dropped while nothing was watching is
+    // never reported as still connected.
+    await _bleManager.reconcile();
+
     var devices = Map<String, MidiDevice>();
 
     Pointer<MIDIINCAPS> inCaps = malloc<MIDIINCAPS>();
@@ -105,18 +122,13 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       //print(
       //    "${id} ${inCaps.ref.wMid} ${inCaps.ref.wPid} ${inCaps.ref.hashCode} ${inCaps.ref.dwSupport}");
 
-      bool isConnected = _connectedDevices.containsKey(id);
       //print('found IN at i $i id $id for device $name');
-      devices[id] =
-          WindowsMidiDevice(
-              id,
-              name,
-              _rxStreamController,
-              _setupStreamController,
-              _midiCB.nativeFunction.address,
-            )
-            ..addInput(i, inCaps.ref)
-            ..connected = isConnected;
+      devices[id] = WindowsMidiDevice(
+        id,
+        name,
+        _rxStreamController,
+        _midiCB.nativeFunction.address,
+      )..addInput(i, inCaps.ref);
     }
 
     free(inCaps);
@@ -149,23 +161,25 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       } else {
         // print('found OUT at i $i id $id for device $name');
 
-        bool isConnected = _connectedDevices.containsKey(id);
-        devices[id] =
-            WindowsMidiDevice(
-                id,
-                name,
-                _rxStreamController,
-                _setupStreamController,
-                _midiCB.nativeFunction.address,
-              )
-              ..addOutput(i, outCaps.ref)
-              ..connected = isConnected;
+        devices[id] = WindowsMidiDevice(
+          id,
+          name,
+          _rxStreamController,
+          _midiCB.nativeFunction.address,
+        )..addOutput(i, outCaps.ref);
       }
     }
 
     free(outCaps);
 
-    devices.addAll(_discoveredBLEDevices);
+    // Hand out the live object for a connected device rather than the wrapper
+    // just built from the enumeration: the stored one owns the open handles, and
+    // it is the one rx packets are tagged with.
+    _connectedDevices.forEach((id, device) {
+      if (devices.containsKey(id)) devices[id] = device;
+    });
+
+    devices.addAll(_bleManager.devices);
 
     return devices.values.toList();
   }
@@ -173,62 +187,8 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   /// Prepares Bluetooth system
   @override
   Future<void> startBluetoothCentral() async {
-    UniversalBle.timeout = const Duration(seconds: 10);
-
-    UniversalBle.onAvailabilityChange = (state) {
-      _bleState = state.name;
-      _bluetoothStateStreamController.add(state.name);
-    };
-
-    UniversalBle.onScanResult = (result) {
-      if (!_discoveredBLEDevices.containsKey(result.deviceId)) {
-        if (result.name != null) {
-          debugPrint(
-            "${result.name} ${result.deviceId} ${result.manufacturerDataList.map((e) => e.toString()).join(', ')}",
-          );
-          _discoveredBLEDevices[result.deviceId] = BLEMidiDevice(
-            result.deviceId,
-            result.name!,
-            _rxStreamController,
-          );
-          _setupStreamController.add('deviceAppeared');
-        }
-      }
-    };
-
-    UniversalBle.onConnectionChange = (deviceId, isConnected, error) {
-      if (_discoveredBLEDevices.containsKey(deviceId)) {
-        if (isConnected) {
-          _discoveredBLEDevices[deviceId]!.connectionState =
-              BleConnectionState.connected;
-          _setupStreamController.add('deviceConnected');
-        } else {
-          // Only treat this as a disconnect if we were actually connected, so we
-          // don't emit for a discovered-but-never-connected device that drops.
-          // Keep the device in the discovered list so it stays reconnectable
-          // without requiring a new scan.
-          var device = _discoveredBLEDevices[deviceId];
-          if (device != null && device.connected) {
-            device.connected = false;
-            _setupStreamController.add('deviceDisconnected');
-            _deviceDisconnectedController.add(device);
-          }
-        }
-      }
-    };
-
-    UniversalBle.onValueChange =
-        (deviceId, characteristicId, Uint8List data, int? timestamp) {
-          if (_discoveredBLEDevices.containsKey(deviceId)) {
-            _discoveredBLEDevices[deviceId]!.handleData(data);
-          }
-        };
-
-    UniversalBle.onPairingStateChange = (deviceId, isPaired) {
-      if (_discoveredBLEDevices.containsKey(deviceId)) {
-        _discoveredBLEDevices[deviceId]!.pairingState = isPaired;
-      }
-    };
+    _ensureDeviceManager();
+    await _bleManager.start();
   }
 
   /// Stream firing events whenever a change in bluetooth central state happens
@@ -240,81 +200,83 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   /// Returns the current state of the bluetooth subsystem
   @override
   Future<String> bluetoothState() async {
-    return _bleState;
+    return _bleManager.state;
   }
 
   /// Starts scanning for BLE MIDI devices.
   ///
   /// Found devices will be included in the list returned by [devices].
+  /// Throws when Bluetooth is not available.
+  @override
   Future<void> startScanningForBluetoothDevices() async {
-    try {
-      await UniversalBle.startScan(
-        scanFilter: ScanFilter(withServices: [MIDI_SERVICE_ID]),
-      );
-    } catch (e) {
-      print(e.toString());
-    }
+    await _bleManager.startScanning();
   }
 
+  /// Stops scanning for BLE MIDI devices.
   @override
   void stopScanningForBluetoothDevices() {
-    /// Stops scanning for BLE MIDI devices.
-    UniversalBle.stopScan();
-
-    // Prune discovered-but-not-connected devices so a later [devices] call no
-    // longer lists BLE peripherals that went out of range while scanning (BLE
-    // provides no "scan result removed" event, so this is the point at which we
-    // know the discovered set is stale). Connected devices are kept since the
-    // active session - data reception and disconnect - relies on their entry
-    // here. Mirrors the Android backend, which prunes the discovered set on
-    // scan stop (it can clear the whole set because it tracks connected devices
-    // separately; here connected devices live in the same map).
-    _discoveredBLEDevices.removeWhere((_, device) => !device.connected);
+    _bleManager.stopScanning();
   }
 
   /// Connects to the device.
+  ///
+  /// The returned future resolves once the device is usable, and throws a
+  /// [PlatformException] if the connection could not be established.
   @override
   Future<void> connectToDevice(
     MidiDevice device, {
     List<MidiPort>? ports,
   }) async {
-    if (device is WindowsMidiDevice) {
-      var success = device.connect();
-      if (success) {
-        _connectedDevices[device.id] = device;
-      } else {
-        print("failed to connect $device");
-      }
-    } else if (device is BLEMidiDevice) {
-      device.connect();
+    _ensureDeviceManager();
+
+    if (device is BLEMidiDevice) {
+      return _bleManager.connect(device);
     }
+
+    var windowsDevice = device as WindowsMidiDevice;
+    // Keyed by id, not by object: the devices getter builds a fresh wrapper on
+    // every call, so without this two enumerations could open two sets of
+    // handles for the same device and orphan the first.
+    if (_connectedDevices.containsKey(windowsDevice.id)) {
+      throw PlatformException(
+        code: 'MESSAGEERROR',
+        message: 'Device already connected',
+        details: windowsDevice.id,
+      );
+    }
+
+    if (!windowsDevice.connect()) {
+      _setupStreamController.add("connectionFailed");
+      throw PlatformException(
+        code: 'MESSAGEERROR',
+        message: 'Failed to open device',
+        details: windowsDevice.id,
+      );
+    }
+    _connectedDevices[windowsDevice.id] = windowsDevice;
+    _setupStreamController.add("deviceConnected");
   }
 
   /// Disconnects from the device.
   @override
-  void disconnectDevice(MidiDevice device, {bool remove = true}) {
-    if (device is WindowsMidiDevice) {
-      if (_connectedDevices.containsKey(device.id)) {
-        var windowsDevice = _connectedDevices[device.id]!;
-        var result = windowsDevice.disconnect();
-        if (result) {
-          // For an explicit disconnect remove the device from the connected map
-          // and notify. When called from teardown (remove: false) the map is
-          // being iterated and cleared by the caller, so skip the mutation here
-          // to avoid a ConcurrentModificationError.
-          if (remove) {
-            _connectedDevices.remove(device.id);
-            _setupStreamController.add("deviceDisconnected");
-            _deviceDisconnectedController.add(windowsDevice);
-          }
-        } else {
-          print("failed to close $windowsDevice");
-        }
-      }
-    } else if (device is BLEMidiDevice) {
-      // The disconnect event is emitted from the onConnectionChange callback.
-      device.disconnect();
+  void disconnectDevice(MidiDevice device) {
+    if (device is BLEMidiDevice) {
+      _bleManager.disconnect(device);
+      return;
     }
+    _removeNativeDevice(device.id);
+  }
+
+  /// The single removal path for native devices. Idempotent: whichever trigger
+  /// fires first (explicit disconnect, the DeviceManager diff, teardown) removes
+  /// the entry and emits, later ones find it gone. Explicit and unexpected
+  /// removals are indistinguishable to the client.
+  void _removeNativeDevice(String deviceId) {
+    var device = _connectedDevices.remove(deviceId);
+    if (device == null) return;
+    device.close();
+    _setupStreamController.add("deviceDisconnected");
+    _deviceDisconnectedController.add(device);
   }
 
   @override
@@ -324,26 +286,8 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
     // every WindowsMidiDevice, so closing it would invalidate reconnection. This
     // (singleton) instance must stay reusable after teardown, which only
     // disconnects devices per the documented contract.
-
-    // Disconnect native devices. Pass remove: false so disconnectDevice does not
-    // mutate _connectedDevices while we iterate it; the map is cleared afterwards
-    // and the disconnect event is emitted here per device.
-    _connectedDevices.values.forEach((device) {
-      disconnectDevice(device, remove: false);
-      device.connected = false;
-      _deviceDisconnectedController.add(device);
-    });
-    _connectedDevices.clear();
-
-    // Disconnect any connected BLE devices as well. Their disconnect event is
-    // emitted from the onConnectionChange callback.
-    _discoveredBLEDevices.values.where((device) => device.connected).forEach((
-      device,
-    ) {
-      disconnectDevice(device, remove: false);
-    });
-
-    _setupStreamController.add("deviceDisconnected");
+    _connectedDevices.keys.toList().forEach(_removeNativeDevice);
+    _bleManager.teardown();
     // Do not close _rxStreamController here: teardown only disconnects devices.
     // Closing the broadcast controller would leave this (singleton) instance
     // unusable for any later connect/sendData.
@@ -358,22 +302,19 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
       // Send to specific device, if present
       _connectedDevices[deviceId]?.send(data);
 
-      _discoveredBLEDevices.values
-          .where((element) => element.deviceId == deviceId)
-          .forEach((element) {
-            element.send(data);
-          });
+      var bleDevice = _bleManager.devices[deviceId];
+      if (bleDevice != null && bleDevice.connected) bleDevice.send(data);
     } else {
       // Send to all devices
       _connectedDevices.values.forEach((device) {
         device.send(data);
       });
 
-      _discoveredBLEDevices.values
-          .where((element) => element.connected)
-          .forEach((element) {
-            element.send(data);
-          });
+      _bleManager.devices.values.where((element) => element.connected).forEach((
+        element,
+      ) {
+        element.send(data);
+      });
     }
   }
 
@@ -391,6 +332,7 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   /// For example, when a new BLE devices is discovered.
   @override
   Stream<String>? get onMidiSetupChanged {
+    _ensureDeviceManager();
     return _setupStream;
   }
 
@@ -487,18 +429,10 @@ class FlutterMidiCommandWindows extends MidiCommandPlatform {
   /// unplug) by diffing against the currently present devices, and notifies clients.
   void _handleNativeDeviceRemoval() {
     var presentIds = _presentNativeDeviceIds();
-    var removed = _connectedDevices.keys
+    _connectedDevices.keys
         .where((id) => !presentIds.contains(id))
-        .toList();
-    for (var id in removed) {
-      var device = _connectedDevices.remove(id);
-      if (device != null) {
-        device.disconnect();
-        device.connected = false;
-        _deviceDisconnectedController.add(device);
-        _setupStreamController.add("deviceDisconnected");
-      }
-    }
+        .toList()
+        .forEach(_removeNativeDevice);
   }
 
   //#endregion
