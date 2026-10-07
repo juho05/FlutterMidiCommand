@@ -113,6 +113,13 @@ abstract class MidiCommandPlatform extends PlatformInterface {
         'get onMidiDeviceDisconnected has not been implemented.');
   }
 
+  /// Stream firing events whenever a connected BLE device reports its battery
+  /// level, with [MidiDevice.batteryLevel] set.
+  Stream<MidiDevice>? get onBatteryLevelChanged {
+    throw UnimplementedError(
+        'get onBatteryLevelChanged has not been implemented.');
+  }
+
   /// Creates a virtual MIDI source.
   void addVirtualDevice({String? name}) {
     throw UnimplementedError('addVirtualDevice() has not been implemented.');

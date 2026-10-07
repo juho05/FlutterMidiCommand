@@ -49,6 +49,8 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
   lateinit var rxStreamHandler: FMCStreamHandler
   lateinit var disconnectChannel: EventChannel
   lateinit var disconnectStreamHandler: FMCStreamHandler
+  lateinit var batteryChannel: EventChannel
+  lateinit var batteryStreamHandler: FMCStreamHandler
   var bluetoothState: String = "unknown"
     set(value) {
       bluetoothStateHandler.send(value)
@@ -196,6 +198,10 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
     disconnectStreamHandler = FMCStreamHandler(handler)
     disconnectChannel = EventChannel(messenger, "plugins.invisiblewrench.com/flutter_midi_command/disconnect_channel")
     disconnectChannel.setStreamHandler( disconnectStreamHandler )
+
+    batteryStreamHandler = FMCStreamHandler(handler)
+    batteryChannel = EventChannel(messenger, "plugins.invisiblewrench.com/flutter_midi_command/battery_channel")
+    batteryChannel.setStreamHandler( batteryStreamHandler )
 
     // Reconcile connected devices whenever the app returns to the foreground.
     // While the process is backgrounded/suspended the one-shot onDeviceRemoved
@@ -992,7 +998,9 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
 
     Log.d("FlutterMIDICommand", "list $list")
 
-    return list.values.toList()
+    return list.map { (id, device) ->
+      connectedDevices[id]?.batteryLevel?.let { device + ("batteryLevel" to it) } ?: device
+    }
   }
 
 
@@ -1029,11 +1037,13 @@ class FlutterMidiCommandPlugin : FlutterPlugin, ActivityAware, MethodCallHandler
 
     val device = ConnectedDevice(opened, setupStreamHandler)
     device.disconnectStreamHandler = disconnectStreamHandler
+    device.batteryStreamHandler = batteryStreamHandler
     connectedDevices[deviceId] = device
     device.connectWithStreamHandler(rxStreamHandler,
       onSuccess = {
         Log.d("FlutterMIDICommand", "Opened device id $deviceId")
         completeConnectSuccess(deviceId)
+        device.startBatteryMonitor(context)
       },
       onFailure = { message -> removeDevice(deviceId, message) })
   }

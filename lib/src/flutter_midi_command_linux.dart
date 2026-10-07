@@ -77,6 +77,8 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   StreamController<MidiDevice> _deviceDisconnectedController =
       StreamController<MidiDevice>.broadcast();
   late Stream<MidiDevice> _deviceDisconnectedStream;
+  StreamController<MidiDevice> _batteryLevelController =
+      StreamController<MidiDevice>.broadcast();
 
   StreamController<String> _bluetoothStateStreamController =
       StreamController<String>.broadcast();
@@ -106,6 +108,7 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
       onSetupEvent: (event) => _setupStreamController.add(event),
       onDeviceDisconnected: (device) =>
           _deviceDisconnectedController.add(device),
+      onBatteryLevel: (device) => _batteryLevelController.add(device),
       onBluetoothState: (state) => _bluetoothStateStreamController.add(state),
     );
 
@@ -397,6 +400,12 @@ class FlutterMidiCommandLinux extends MidiCommandPlatform {
   @override
   Stream<MidiDevice>? get onMidiDeviceDisconnected {
     return _deviceDisconnectedStream;
+  }
+
+  /// Stream firing whenever a connected BLE device reports its battery level.
+  @override
+  Stream<MidiDevice>? get onBatteryLevelChanged {
+    return _batteryLevelController.stream;
   }
 
   /// Creates a virtual MIDI source

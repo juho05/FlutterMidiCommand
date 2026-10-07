@@ -38,6 +38,7 @@ Import flutter_midi_command
 - Stop scanning for BLE MIDI devices by calling `MidiCommand().stopScanningForBluetoothDevices()`
 - Disconnect from the current device by calling `MidiCommand.disconnectDevice()`
 - Listen for updates in the MIDI setup by subscribing to `MidiCommand().onMidiSetupChanged`
+- Show the charge of connected BLE devices by subscribing to `MidiCommand().onBatteryLevelChanged`, which fires with the `MidiDevice` whenever a device reports its battery level. The last known level (0-100, `null` if the device does not report one) is also available as `MidiDevice.batteryLevel` on the devices returned by `MidiCommand().devices`.
 - Listen for incoming MIDI messages on from the current device by subscribing to `MidiCommand().onMidiDataReceived`, after which the listener will recieve inbound MIDI messages as an UInt8List of variable length.
 - Send a MIDI message by calling `MidiCommand.sendData(data)`, where data is an UInt8List of bytes following the MIDI spec.
 - Or use the various `MidiCommand` subtypes to send PC, CC, NoteOn and NoteOff messages.

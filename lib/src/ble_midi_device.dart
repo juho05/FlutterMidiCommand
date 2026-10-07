@@ -13,6 +13,8 @@ enum ConnectionState { Disconnected, Connecting, Connected }
 
 const MIDI_SERVICE_ID = "03B80E5A-EDE8-4B33-A751-6CE34EC4C700";
 const MIDI_CHARACTERISTIC_ID = "7772E5DB-3868-4112-A1A9-F2669D106BF3";
+const BATTERY_SERVICE_ID = "0000180f-0000-1000-8000-00805f9b34fb";
+const BATTERY_LEVEL_CHARACTERISTIC_ID = "00002a19-0000-1000-8000-00805f9b34fb";
 
 // BLE MIDI parsing
 enum BLE_HANDLER_STATE { HEADER, TIMESTAMP, STATUS, STATUS_RUNNING, PARAMS, SYSTEM_RT, SYSEX, SYSEX_END, SYSEX_INT }
@@ -42,6 +44,7 @@ class BLEMidiDevice extends MidiDevice {
 
   BleService? _midiService;
   BleCharacteristic? _midiCharacteristic;
+  bool _hasBatteryLevel = false;
 
   BLEMidiDevice(this.deviceId, this.name, this._rxStreamCtrl) : super(deviceId, name, 'BLE', false) {}
 
@@ -68,6 +71,9 @@ class BLEMidiDevice extends MidiDevice {
       return false;
     }
     devState = DeviceState.Available;
+    _hasBatteryLevel = services.any((service) =>
+        service.uuid.toLowerCase() == BATTERY_SERVICE_ID &&
+        service.characteristics.any((characteristic) => characteristic.uuid.toLowerCase() == BATTERY_LEVEL_CHARACTERISTIC_ID));
 
     // Subscribe to the MIDI characteristic up front, before (and regardless
     // of) pairing. BLE-MIDI does not mandate bonding and many peripherals
@@ -84,6 +90,38 @@ class BLEMidiDevice extends MidiDevice {
     // the device is usable now. Pairing may block on an agent interaction that
     // never comes, which must not hold up the connect result.
     _pairIfNeeded();
+    return true;
+  }
+
+  /// Reads the battery level and subscribes to its changes. Returns whether a
+  /// level was read. Best effort, many peripherals do not report one.
+  Future<bool> startBatteryUpdates() async {
+    if (!_hasBatteryLevel) return false;
+    var changed = false;
+    try {
+      changed = handleBatteryData(await UniversalBle.read(deviceId, BATTERY_SERVICE_ID, BATTERY_LEVEL_CHARACTERISTIC_ID));
+    } catch (e) {
+      print('battery read failed: $e');
+    }
+    try {
+      await UniversalBle.subscribeNotifications(deviceId, BATTERY_SERVICE_ID, BATTERY_LEVEL_CHARACTERISTIC_ID);
+    } catch (e) {
+      print('battery subscribe failed: $e');
+    }
+    return changed;
+  }
+
+  /// Returns whether the level changed.
+  bool handleBatteryData(Uint8List data) {
+    if (!_hasBatteryLevel || data.isEmpty) return false;
+    return setBatteryLevel(data[0]);
+  }
+
+  /// Returns whether the level changed.
+  bool setBatteryLevel(int percent) {
+    var level = min(percent, 100);
+    if (level == batteryLevel) return false;
+    batteryLevel = level;
     return true;
   }
 
@@ -108,6 +146,8 @@ class BLEMidiDevice extends MidiDevice {
     devState = DeviceState.None;
     _midiService = null;
     _midiCharacteristic = null;
+    _hasBatteryLevel = false;
+    batteryLevel = null;
     _maxWriteSize = 20;
     bleHandlerState = BLE_HANDLER_STATE.HEADER;
     sysExBuffer.clear();

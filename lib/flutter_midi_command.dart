@@ -167,6 +167,16 @@ class MidiCommand {
     return _platform.onMidiDeviceDisconnected;
   }
 
+  /// Stream firing whenever a connected BLE device reports its battery level.
+  ///
+  /// Fires once after connecting and then on every change, for devices that
+  /// provide a battery level. The event contains the [MidiDevice] with
+  /// [MidiDevice.batteryLevel] set to the charge in percent (0-100). The last
+  /// known level is also available on the devices returned by [devices].
+  Stream<MidiDevice>? get onBatteryLevelChanged {
+    return _platform.onBatteryLevelChanged;
+  }
+
   /// Stream firing events whenever a midi package is sent
   ///
   /// The event contains the raw bytes contained in the MIDI package

@@ -12,6 +12,8 @@ const EventChannel _bluetoothStateChannel = EventChannel(
     'plugins.invisiblewrench.com/flutter_midi_command/bluetooth_central_state');
 const EventChannel _disconnectChannel = EventChannel(
     'plugins.invisiblewrench.com/flutter_midi_command/disconnect_channel');
+const EventChannel _batteryChannel = EventChannel(
+    'plugins.invisiblewrench.com/flutter_midi_command/battery_channel');
 
 /// An implementation of [MidiCommandPlatform] that uses method channels.
 class MethodChannelMidiCommand extends MidiCommandPlatform {
@@ -19,6 +21,7 @@ class MethodChannelMidiCommand extends MidiCommandPlatform {
   Stream<String>? _setupStream;
   Stream<String>? _bluetoothStateStream;
   Stream<MidiDevice>? _disconnectStream;
+  Stream<MidiDevice>? _batteryStream;
 
   /// Returns a list of found MIDI devices.
   @override
@@ -28,6 +31,7 @@ class MethodChannelMidiCommand extends MidiCommandPlatform {
       var map = m.cast<String, Object>();
       var dev = MidiDevice(map["id"].toString(), map["name"] ?? "-",
           map["type"], map["connected"] == "true");
+      dev.batteryLevel = map["batteryLevel"] as int?;
       dev.inputPorts = _portsFromDevice(map["inputs"], MidiPortType.IN);
       dev.outputPorts = _portsFromDevice(map["outputs"], MidiPortType.OUT);
       return dev;
@@ -166,6 +170,21 @@ class MethodChannelMidiCommand extends MidiCommandPlatform {
           dd["id"].toString(), name.toString(), dd["type"].toString(), false);
     });
     return _disconnectStream;
+  }
+
+  /// Stream firing events whenever a connected BLE device reports its battery
+  /// level.
+  @override
+  Stream<MidiDevice>? get onBatteryLevelChanged {
+    _batteryStream ??=
+        _batteryChannel.receiveBroadcastStream().map<MidiDevice>((d) {
+      var dd = (d as Map);
+      var name = dd["name"] ?? dd["id"];
+      return MidiDevice(
+          dd["id"].toString(), name.toString(), dd["type"].toString(), true)
+        ..batteryLevel = dd["batteryLevel"] as int?;
+    });
+    return _batteryStream;
   }
 
   /// Creates a virtual MIDI source

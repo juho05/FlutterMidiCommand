@@ -58,6 +58,9 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     var disconnectChannel: FlutterEventChannel?
     var disconnectStreamHandler = StreamHandler()
 
+    var batteryChannel: FlutterEventChannel?
+    var batteryStreamHandler = StreamHandler()
+
     
 #if os(iOS)
     // Network Session
@@ -139,6 +142,13 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
 #endif
         disconnectChannel?.setStreamHandler(disconnectStreamHandler)
 
+#if os(macOS)
+        batteryChannel = FlutterEventChannel(name: "plugins.invisiblewrench.com/flutter_midi_command/battery_channel", binaryMessenger: registrar.messenger)
+#else
+        batteryChannel = FlutterEventChannel(name: "plugins.invisiblewrench.com/flutter_midi_command/battery_channel", binaryMessenger: registrar.messenger())
+#endif
+        batteryChannel?.setStreamHandler(batteryStreamHandler)
+
         
         // MIDI client with notification handler
         MIDIClientCreateWithBlock("plugins.invisiblewrench.com.FlutterMidiCommand" as CFString, &midiClient) { (notification) in
@@ -193,6 +203,19 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
     }
     
     
+    func sendBatteryLevel(_ device: ConnectedBLEDevice) {
+        guard let level = device.batteryLevel else { return }
+        let data: [String: Any] = [
+            "id": device.id,
+            "name": device.peripheral.name ?? device.id,
+            "type": "BLE",
+            "batteryLevel": level
+        ]
+        DispatchQueue.main.async {
+            self.batteryStreamHandler.send(data: data)
+        }
+    }
+
     func extractName(arguments: Any?) -> String?{
         var name: String? = nil
         if let packet = arguments as? Dictionary<String, Any> {
@@ -437,6 +460,9 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         if type == "BLE" {
             if let periph = discoveredDevices.filter({ (p) -> Bool in p.identifier.uuidString == deviceId }).first {
                 let device = ConnectedBLEDevice(id: deviceId, type: type, streamHandler: rxStreamHandler, result:ongoingConnections[deviceId], peripheral: periph, ports:ports)
+                device.onBatteryLevel = { [weak self] dev in
+                    self?.sendBatteryLevel(dev)
+                }
                 connectedDevices[deviceId] = device
                 manager.stopScan()
                 manager.connect(periph, options: nil)
@@ -1007,7 +1033,13 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, CBCentralManagerDelegate, 
         devices.append(contentsOf: ownVirtualDevices.values)
         
         
-        return devices;
+        return devices.map { device in
+            guard let id = device["id"] as? String,
+                  let level = (connectedDevices[id] as? ConnectedBLEDevice)?.batteryLevel else { return device }
+            var withBattery = device
+            withBattery["batteryLevel"] = level
+            return withBattery
+        }
     }
     
     
@@ -1988,6 +2020,14 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
     var onSetupSucceeded : ((ConnectedBLEDevice) -> Void)?
     var onSetupFailed : ((ConnectedBLEDevice, FlutterError) -> Void)?
 
+    static let midiServiceUUID = CBUUID(string: "03B80E5A-EDE8-4B33-A751-6CE34EC4C700")
+    static let batteryServiceUUID = CBUUID(string: "180F")
+    static let batteryLevelUUID = CBUUID(string: "2A19")
+
+    // Last reported charge in percent, nil when the device reports none.
+    var batteryLevel : Int?
+    var onBatteryLevel : ((ConnectedBLEDevice) -> Void)?
+
     init(id:String, type:String, streamHandler:StreamHandler, result:FlutterResult?, peripheral:CBPeripheral, ports:[Port]?) {
         self.peripheral = peripheral
         self.connectResult = result
@@ -1999,7 +2039,7 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
         onSetupSucceeded = onSuccess
         onSetupFailed = onFailure
         peripheral.delegate = self
-        peripheral.discoverServices([CBUUID(string: "03B80E5A-EDE8-4B33-A751-6CE34EC4C700")])
+        peripheral.discoverServices([ConnectedBLEDevice.midiServiceUUID, ConnectedBLEDevice.batteryServiceUUID])
     }
 
     func cancelConnectTimeout() {
@@ -2159,7 +2199,7 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
         // On error the services array is nil; force-unwrapping would crash before
         // the failure branch could run. Treat error / no services as discovery
         // failure and tear the device down.
-        guard error == nil, let services = peripheral.services, !services.isEmpty else {
+        guard error == nil, let services = peripheral.services, services.contains(where: { $0.uuid == ConnectedBLEDevice.midiServiceUUID }) else {
             onSetupFailed?(self, FlutterError(code: "BLEERROR", message: error?.localizedDescription ?? "Did not discover MIDI services", details: id))
             return
         }
@@ -2170,6 +2210,16 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         print("perif didDiscoverCharacteristicsFor  \(String(describing: service.characteristics))")
+        // The battery level is optional, it must never fail the MIDI setup.
+        if service.uuid == ConnectedBLEDevice.batteryServiceUUID {
+            if let battery = service.characteristics?.first(where: { $0.uuid == ConnectedBLEDevice.batteryLevelUUID }) {
+                peripheral.readValue(for: battery)
+                if battery.properties.contains(.notify) {
+                    peripheral.setNotifyValue(true, for: battery)
+                }
+            }
+            return
+        }
         guard error == nil, let characteristics = service.characteristics, !characteristics.isEmpty else {
             onSetupFailed?(self, FlutterError(code: "BLEERROR", message: error?.localizedDescription ?? "Did not discover MIDI characteristics", details: id))
             return
@@ -2203,6 +2253,13 @@ class ConnectedBLEDevice : ConnectedDevice, CBPeripheralDelegate {
     
     public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         // print("perif didUpdateValueFor  \(String(describing: characteristic))")
+        if characteristic.uuid == ConnectedBLEDevice.batteryLevelUUID {
+            if let level = characteristic.value?.first.map({ min(Int($0), 100) }), level != batteryLevel {
+                batteryLevel = level
+                onBatteryLevel?(self)
+            }
+            return
+        }
         if let value = characteristic.value {
             parseBLEPacket(value, peripheral:peripheral)
         }

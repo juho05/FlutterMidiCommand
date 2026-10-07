@@ -8,6 +8,10 @@ class MidiDevice {
   List<MidiPort> outputPorts = [];
   bool connected;
 
+  /// Battery charge in percent (0-100) of a connected BLE device that reports
+  /// it, null otherwise.
+  int? batteryLevel;
+
   MidiDevice(this.id, this.name, this.type, this.connected);
 
   Map<String, Object> get toDictionary {

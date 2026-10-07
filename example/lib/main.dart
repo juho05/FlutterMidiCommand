@@ -20,6 +20,7 @@ class MyAppState extends State<MyApp> {
   StreamSubscription<String>? _setupSubscription;
   StreamSubscription<BluetoothState>? _bluetoothStateSubscription;
   StreamSubscription<MidiDevice>? _deviceDisconnectedSubscription;
+  StreamSubscription<MidiDevice>? _batteryLevelSubscription;
   final MidiCommand _midiCommand = MidiCommand();
 
   final GlobalKey<ScaffoldMessengerState> _scaffoldMessengerKey =
@@ -61,6 +62,14 @@ class MyAppState extends State<MyApp> {
       setState(() {});
     });
 
+    _batteryLevelSubscription =
+        _midiCommand.onBatteryLevelChanged?.listen((device) {
+      if (kDebugMode) {
+        print("battery level of ${device.name}: ${device.batteryLevel}%");
+      }
+      setState(() {});
+    });
+
     _updateNetworkSessionState();
   }
 
@@ -69,6 +78,7 @@ class MyAppState extends State<MyApp> {
     _setupSubscription?.cancel();
     _bluetoothStateSubscription?.cancel();
     _deviceDisconnectedSubscription?.cancel();
+    _batteryLevelSubscription?.cancel();
     super.dispose();
   }
 
@@ -260,7 +270,8 @@ class MyAppState extends State<MyApp> {
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
                       subtitle: Text(
-                          "ins:${device.inputPorts.length} outs:${device.outputPorts.length}, ${device.id}, ${device.type}"),
+                          "ins:${device.inputPorts.length} outs:${device.outputPorts.length}, ${device.id}, ${device.type}"
+                          "${device.batteryLevel != null ? ", battery ${device.batteryLevel}%" : ""}"),
                       leading: Icon(device.connected
                           ? Icons.radio_button_on
                           : Icons.radio_button_off),

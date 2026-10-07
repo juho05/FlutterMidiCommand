@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:universal_ble/universal_ble.dart';
 
 import 'ble_midi_device.dart';
+import 'bluez_battery_watcher.dart';
 import 'midi_command_platform_interface.dart';
 
 /// Timing shared by all four backends, see platform-matching.md.
@@ -26,6 +28,7 @@ class BleMidiManager {
     required StreamController<MidiPacket> rxStreamController,
     required this.onSetupEvent,
     required this.onDeviceDisconnected,
+    required this.onBatteryLevel,
     required this.onBluetoothState,
   }) : _rxStreamController = rxStreamController;
 
@@ -35,6 +38,7 @@ class BleMidiManager {
   /// deviceConnected, deviceDisconnected, connectionFailed.
   final void Function(String event) onSetupEvent;
   final void Function(MidiDevice device) onDeviceDisconnected;
+  final void Function(MidiDevice device) onBatteryLevel;
   final void Function(String state) onBluetoothState;
 
   final Map<String, BLEMidiDevice> _devices = {};
@@ -50,6 +54,9 @@ class BleMidiManager {
   /// Whether the app currently wants a scan. A connect stops the scanner while
   /// a scan is still wanted, so an idle scanner is not the same as "no scan".
   bool _scanRequested = false;
+
+  /// Linux only, where the battery level comes from BlueZ rather than GATT.
+  BluezBatteryWatcher? _bluezBattery;
 
   final Set<String> _ongoingConnections = {};
   Timer? _reconcileTimer;
@@ -89,12 +96,22 @@ class BleMidiManager {
     };
 
     UniversalBle.onValueChange = (deviceId, characteristicId, data, timestamp) {
-      _devices[deviceId]?.handleData(data);
+      var device = _devices[deviceId];
+      if (device == null) return;
+      if (characteristicId.toLowerCase() == BATTERY_LEVEL_CHARACTERISTIC_ID) {
+        if (device.handleBatteryData(data)) onBatteryLevel(device);
+        return;
+      }
+      device.handleData(data);
     };
 
     UniversalBle.onPairingStateChange = (deviceId, isPaired) {
       _devices[deviceId]?.pairingState = isPaired;
     };
+
+    if (Platform.isLinux) {
+      _bluezBattery = BluezBatteryWatcher(_handleSystemBatteryLevel)..start();
+    }
 
     // Publish the current state up front. universal_ble reports it through
     // onAvailabilityChange as well, but only after an async round trip, so
@@ -285,7 +302,27 @@ class BleMidiManager {
     _ongoingConnections.remove(deviceId);
     stored.connected = true;
     onSetupEvent('deviceConnected');
+    // Not awaited, the battery level is optional and must not delay the connect.
+    _startBatteryUpdates(stored);
     await _resumeScanIfNeeded();
+  }
+
+  Future<void> _startBatteryUpdates(BLEMidiDevice device) async {
+    var changed = await device.startBatteryUpdates();
+    if (!device.connected) return;
+    // BlueZ may have published the level before the connect completed.
+    var systemLevel = _bluezBattery?.levelFor(device.deviceId);
+    if (systemLevel != null) {
+      changed = device.setBatteryLevel(systemLevel) || changed;
+    }
+    if (changed) onBatteryLevel(device);
+  }
+
+  void _handleSystemBatteryLevel(String deviceId, int level) {
+    var device = _devices[deviceId];
+    if (device != null && device.connected && device.setBatteryLevel(level)) {
+      onBatteryLevel(device);
+    }
   }
 
   /// Tears down a failed attempt. The device was never marked connected, so

@@ -16,6 +16,8 @@ dependencies:
   ffi: ^2.1.4
   win32: ^6.0.0
   universal_ble: ^2.0.4
+  # Battery level of BLE devices on Linux, which BlueZ only exposes over D-Bus
+  dbus: ^0.7.11
   device_manager: ^0.0.7
 
 dev_dependencies:

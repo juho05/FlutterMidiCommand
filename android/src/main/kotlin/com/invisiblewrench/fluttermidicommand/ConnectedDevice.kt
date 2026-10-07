@@ -1,5 +1,6 @@
 package com.invisiblewrench.fluttermidicommand
 
+import android.content.Context
 import android.content.pm.ServiceInfo
 import android.media.midi.*
 import android.util.Log
@@ -15,6 +16,12 @@ class ConnectedDevice : Device {
     private var isOwnVirtualDevice = false
     private var connectionJob: Job? = null
     private var isClosed = false
+
+    /// Last reported charge in percent, null when the device reports none.
+    @Volatile var batteryLevel: Int? = null
+        private set
+    var batteryStreamHandler: FMCStreamHandler? = null
+    private var batteryMonitor: BatteryMonitor? = null
 
     override val deviceInfo: Map<String, Any?>
         get() = mapOf(
@@ -93,6 +100,15 @@ class ConnectedDevice : Device {
         }
     }
 
+    fun startBatteryMonitor(context: Context) {
+        val bluetoothDevice = bluetoothDeviceForInfo(midiDevice.info) ?: return
+        if (isClosed || batteryMonitor != null) return
+        batteryMonitor = BatteryMonitor { level ->
+            batteryLevel = level
+            batteryStreamHandler?.send(deviceInfo + ("batteryLevel" to level))
+        }.also { it.start(context, bluetoothDevice) }
+    }
+
     override fun send(data: ByteArray, timestamp: Long?) {
 
         if(isOwnVirtualDevice) {
@@ -116,6 +132,8 @@ class ConnectedDevice : Device {
         Log.d("FlutterMIDICommand", "Close device - cancelling connection job")
         // Capture device identity before tearing down, while midiDevice.info is still valid
         val info = deviceInfo
+        batteryMonitor?.stop()
+        batteryMonitor = null
         try {
             // Cancel any ongoing connection attempts to prevent leaks
             connectionJob?.cancel()
