@@ -67,7 +67,7 @@ class BluezBatteryWatcher {
     Map<String, Map<String, DBusValue>> interfaces,
   ) {
     var address = interfaces[_deviceInterface]?['Address'];
-    if (address is DBusString) _addresses[path] = address.value;
+    if (address is DBusString) _addresses[path] = address.value.toLowerCase();
     _handleBattery(path, interfaces[_batteryInterface]);
   }
 

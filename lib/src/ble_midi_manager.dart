@@ -67,6 +67,8 @@ class BleMidiManager {
     _started = true;
 
     UniversalBle.timeout = const Duration(seconds: 10);
+    // MIDI writes are fired without awaiting them, the queue keeps them in order.
+    UniversalBle.queueType = QueueType.perDevice;
 
     UniversalBle.onAvailabilityChange = _handleAvailability;
 
@@ -85,24 +87,24 @@ class BleMidiManager {
       _triggerReconcile();
     };
 
-    UniversalBle.onConnectionChange = (deviceId, isConnected, error) {
+    UniversalBle.onConnectionChange = (change) {
       // A successful connect is reported by [connect] itself, which only
       // resolves once the device is genuinely usable. Anything arriving here
       // for a device we are not connected to is a drop we have already handled,
       // or one for a device that never got connected in the first place.
-      if (isConnected) return;
-      var device = _devices[deviceId];
+      if (change.isConnected) return;
+      var device = _devices[change.deviceId];
       if (device != null) _handleDisconnected(device);
     };
 
-    UniversalBle.onValueChange = (deviceId, characteristicId, data, timestamp) {
-      var device = _devices[deviceId];
+    UniversalBle.onValueChange = (value) {
+      var device = _devices[value.deviceId];
       if (device == null) return;
-      if (characteristicId.toLowerCase() == BATTERY_LEVEL_CHARACTERISTIC_ID) {
-        if (device.handleBatteryData(data)) onBatteryLevel(device);
+      if (value.characteristicId.toLowerCase() == BATTERY_LEVEL_CHARACTERISTIC_ID) {
+        if (device.handleBatteryData(value.value)) onBatteryLevel(device);
         return;
       }
-      device.handleData(data);
+      device.handleData(value.value);
     };
 
     UniversalBle.onPairingStateChange = (deviceId, isPaired) {
